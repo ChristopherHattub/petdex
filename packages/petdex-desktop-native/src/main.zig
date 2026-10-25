@@ -32,6 +32,7 @@ const herdr_status = @import("herdr_status.zig");
 const sdk_log = @import("sdk_log.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
+const agent_rail = @import("agent_rail.zig");
 pub const updates = @import("updates.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -351,6 +352,8 @@ pub const Model = struct {
     /// mailbox already keys by session, so the set exists whether or
     /// not the window is open.
     flock: flock_mod.Model = .{},
+    /// Status tab beside the pet, one ringed logo per live agent.
+    rail: agent_rail.Model = .{},
     install: InstallState = .{},
     remotes: [remote_runtime.max_remotes]remote_runtime.Slot = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
     remote_count: usize = 0,
@@ -3031,6 +3034,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // the whole arc.
                 updateBubbleStackInFlight(model, now);
                 syncBubbleWindow(model, fx);
+                syncRailWindow(model, fx);
                 if (model.vx >= physics_min_vel) {
                     setThrowState(model, .@"running-right", fx);
                 } else if (model.vx <= -physics_min_vel) {
@@ -3065,6 +3069,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // needs no cursor.
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
+            syncRailWindow(model, fx);
             if (model.dragging) {
                 if (read.primary_down) {
                     // Follow the cursor keeping the grab offset, and
@@ -3198,6 +3203,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
+                // Ahead of the bubble branch: the rail shows agents even
+                // with bubbles off, and keeps finished ones after their
+                // card expires.
+                var rail_edges: [agent_rail.max_entries]agent_rail.Transition = undefined;
+                _ = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
+                if (railShown(model)) loadAgentsAtlas(model.dark, fx);
                 if (model.settings_open) {
                     for (drained[0..raw_count]) |bubble| {
                         if (std.mem.eql(u8, bubble.agent[0..bubble.agent_len], "dsh")) {
@@ -3246,6 +3257,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
             _ = expireBubbles(model, now);
+            _ = agent_rail.expire(&model.rail, now);
             // A newly drained bubble is declared as a popup in the same
             // update pass. Compute Linux's side after expiry and before
             // that declaration so the first rendered frame uses the same
@@ -4851,6 +4863,18 @@ fn flockBadge(ui: *AppUi, member: *const flock_mod.Member) AppUi.Node {
     return ui.row(.{ .cross = .center, .gap = 3 }, .{ identity, marker });
 }
 
+// ------------------------------------------------------------ agent rail
+
+/// Focus mode silences the pet's chatter; the rail goes with it.
+fn railShown(model: *const Model) bool {
+    return agent_rail.active(&model.rail) and !model.focus_mode and model.sheet_loaded;
+}
+
+fn syncRailWindow(model: *Model, fx: *Effects) void {
+    if (!railShown(model)) return;
+    agent_rail.sync(&model.rail, fx, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
+}
+
 const settings_window_label = "settings";
 const settings_canvas_label = "settings-canvas";
 
@@ -4906,6 +4930,25 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         }
         count += 1;
     }
+    if (railShown(model)) {
+        const origin = agent_rail.wantOrigin(&model.rail, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
+        scratch.windows[count] = .{
+            .label = agent_rail.window_label,
+            .canvas_label = agent_rail.canvas_label,
+            .title = "",
+            .width = agent_rail.windowWidth(),
+            .height = agent_rail.windowHeight(model.rail.len),
+            .x = @floatCast(origin.x),
+            .y = @floatCast(origin.y),
+            .resizable = false,
+            .titlebar = .chromeless,
+            .floating = true,
+            .fullscreen_overlay = true,
+            .transparent = true,
+            .click_through = true,
+        };
+        count += 1;
+    }
     if (model.flock.open) {
         const size = flock_mod.windowSize(model.flock.len, flockLayout(model));
         scratch.windows[count] = .{
@@ -4956,6 +4999,12 @@ test "companion windows use the unified opaque shell" {
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     if (std.mem.eql(u8, window_label, flock_window_label)) return flockView(ui, model);
+    if (std.mem.eql(u8, window_label, agent_rail.window_label)) return agent_rail.railView(ui, &model.rail, .{
+        .ready = agents_icons_ready,
+        .image = agent_icon_atlas_id,
+        .rect = &agentIconRect,
+        .index = &agentIconIndex,
+    });
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
     return settings_view.settingsView(ui, model, .{
         .ready = agents_icons_ready,
@@ -5659,6 +5708,7 @@ test {
     _ = remote_writeback;
     _ = sdk_log;
     _ = settings_view;
+    _ = agent_rail;
 }
 
 test "bubble geometry follows columns lines and font size" {

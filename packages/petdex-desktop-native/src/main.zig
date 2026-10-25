@@ -33,6 +33,7 @@ const sdk_log = @import("sdk_log.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 const agent_rail = @import("agent_rail.zig");
+const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -354,6 +355,8 @@ pub const Model = struct {
     flock: flock_mod.Model = .{},
     /// Status tab beside the pet, one ringed logo per live agent.
     rail: agent_rail.Model = .{},
+    /// Opt-in phone/watch push on the rail's edges; off without config.
+    ntfy: ntfy.Notifier = .{},
     install: InstallState = .{},
     remotes: [remote_runtime.max_remotes]remote_runtime.Slot = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
     remote_count: usize = 0,
@@ -2180,6 +2183,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
         // registry. A secondary desktop forwarding to the first process must
         // not supervise tunnels with credentials that listener cannot know.
         if (owns_hook_listener) startRemotes(model, fx);
+        // Only the process that owns the listener sees every event, so it
+        // alone notifies; a forwarding second instance would double up.
+        if (owns_hook_listener) model.ntfy.config = ntfy.load(home);
     }
     loadAuthSession(model, fx);
     fx.startTimer(.{
@@ -3207,7 +3213,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // with bubbles off, and keeps finished ones after their
                 // card expires.
                 var rail_edges: [agent_rail.max_entries]agent_rail.Transition = undefined;
-                _ = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
+                const edge_count = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
+                ntfy.onTransitions(&model.ntfy, fx, &model.rail, rail_edges[0..edge_count], drained[0..raw_count], now);
                 if (railShown(model)) loadAgentsAtlas(model.dark, fx);
                 if (model.settings_open) {
                     for (drained[0..raw_count]) |bubble| {
@@ -5709,6 +5716,7 @@ test {
     _ = sdk_log;
     _ = settings_view;
     _ = agent_rail;
+    _ = ntfy;
 }
 
 test "bubble geometry follows columns lines and font size" {

@@ -75,6 +75,34 @@ Petdex never rewrites this file when other desktop settings change. If the file
 is unreadable, invalid JSON, or contains an invalid path, Claude hook changes
 are disabled for that run. Correct the file and restart Petdex to try again.
 
+## Agent rail
+
+A translucent tab to the right of the pet shows one logo per live agent
+session. The ring says what it is doing: red while working, yellow while it
+waits on a permission prompt or question, green once the turn ends. Finished
+sessions stay for ten minutes, then drop off. The tab moves to the left of
+the pet near the right screen edge and hides in Focus Mode. macOS and
+Windows only for now. Code: `src/agent_rail.zig`.
+
+## Phone and watch notifications (ntfy, opt-in)
+
+Petdex can push the rail's "needs you" and "finished" edges to a
+self-hosted [ntfy](https://ntfy.sh) server. It is off unless
+`~/.petdex-ntfy/env` exists, is `chmod 600`, and contains:
+
+```sh
+NTFY_URL=https://your-mac.your-tailnet.ts.net   # https, or http to loopback only
+NTFY_TOPIC=your_random_topic
+NTFY_TOKEN=tk_write_only_token
+NTFY_FROM_APP=1
+```
+
+The file is parsed as plain `KEY=VALUE` text, never executed, and read once
+at launch. Use a write-only token scoped to that topic. Secrets never live in
+the repo or in Petdex's settings file. If you also run a separate ntfy agent
+hook, remove it, or you get two notifications for each event. Code:
+`src/ntfy.zig`.
+
 ## Herdr
 
 The local Herdr plugin mirrors agent attention from Herdr into Petdex and

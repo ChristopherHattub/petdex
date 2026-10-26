@@ -122,7 +122,13 @@ pub const Msg = union(enum) {
     set_agent_pet_size_claude: f32,
     set_agent_pet_size_gemini: f32,
     set_agent_pet_size_codex: f32,
-    cycle_agent_pet: u8,
+    /// Slot of the agent whose pet the collection picker is choosing for;
+    /// pressing the open slot again closes it.
+    open_agent_pet_picker: u8,
+    close_agent_pet_picker,
+    /// `slot << 16 | catalog index`.
+    set_agent_pet: u32,
+    reset_agent_pet: u8,
     toggle_section: u8,
     shuffle_pet,
     quit_app,
@@ -401,6 +407,8 @@ pub const Model = struct {
     agent_pet_name_len: [agent_rail.pet_slots]u8 = @splat(0),
     /// Settings sections that are expanded, one bit per `Section`.
     sections_open: u16 = default_sections_open,
+    /// 0 while closed, else the Agent-Pets slot being chosen plus one.
+    agent_pet_picker: u8 = 0,
     /// Opt-in phone/watch push on the rail's edges; off without config.
     ntfy: ntfy.Notifier = .{},
     install: InstallState = .{},
@@ -463,7 +471,7 @@ fn petdexTokens(model: *const Model) canvas.DesignTokens {
 }
 
 pub fn settingsBackground(model: *const Model) canvas.Color {
-    return petdexThemeTokens(model).colors.background;
+    return settings_view.dexShell(model);
 }
 
 fn onAppearance(appearance: native_sdk.platform.Appearance) ?Msg {
@@ -1882,6 +1890,97 @@ fn buildNextThumb(fx: *Effects) void {
     fx.registerImage(thumb_atlas_id, max_catalog * thumb_w, thumb_h, thumbs_pixels) catch {};
 }
 
+/// Animated Agent-Pets. One image holds every slot's pet: per slot a row
+/// of frames for each of `agent_rail.anim_states`, sampled down to
+/// 48x52. 288x624 is 0.72MB, inside the registry's 1MB slot.
+const agent_anim_atlas_id: u64 = 11;
+const anim_tick_ms: i64 = 130;
+const anim_atlas_w: usize = agent_rail.anim_frames_max * 48;
+const anim_atlas_h: usize = agent_rail.pet_slots * agent_rail.anim_states.len * 52;
+var agent_anim_pixels: []u8 = &.{};
+var agent_anim_ready: [agent_rail.pet_slots]bool = @splat(false);
+var agent_anim_built: [agent_rail.pet_slots][64]u8 = @splat(@splat(0));
+var agent_anim_built_len: [agent_rail.pet_slots]u8 = @splat(0);
+
+/// Box-average one source frame into a 48x52 cell, weighting colour by
+/// alpha so transparent edges do not darken the sprite.
+fn downscaleFrame(sheet_pixels: []const u8, sheet_w: usize, src_x: usize, src_y: usize, fw: usize, fh: usize, dst: []u8, dst_x: usize, dst_y: usize) void {
+    const cw: usize = 48;
+    const ch: usize = 52;
+    for (0..ch) |dy| {
+        const y0 = src_y + dy * fh / ch;
+        const y1 = @max(y0 + 1, src_y + (dy + 1) * fh / ch);
+        for (0..cw) |dx| {
+            const x0 = src_x + dx * fw / cw;
+            const x1 = @max(x0 + 1, src_x + (dx + 1) * fw / cw);
+            var sum_a: u32 = 0;
+            var sum_r: u32 = 0;
+            var sum_g: u32 = 0;
+            var sum_b: u32 = 0;
+            var count: u32 = 0;
+            for (y0..y1) |y| {
+                for (x0..x1) |x| {
+                    const px = sheet_pixels[(y * sheet_w + x) * 4 ..][0..4];
+                    const a: u32 = px[3];
+                    sum_r += @as(u32, px[0]) * a;
+                    sum_g += @as(u32, px[1]) * a;
+                    sum_b += @as(u32, px[2]) * a;
+                    sum_a += a;
+                    count += 1;
+                }
+            }
+            const out = dst[((dst_y + dy) * anim_atlas_w + dst_x + dx) * 4 ..][0..4];
+            if (sum_a == 0) {
+                out.* = .{ 0, 0, 0, 0 };
+            } else {
+                out[0] = @intCast(sum_r / sum_a);
+                out[1] = @intCast(sum_g / sum_a);
+                out[2] = @intCast(sum_b / sum_a);
+                out[3] = @intCast(sum_a / count);
+            }
+        }
+    }
+}
+
+/// Build the animation rows for at most one slot whose pet changed. The
+/// decode is the slow part, so like the thumbnails it takes one per tick.
+fn buildAgentAnim(model: *const Model, fx: *Effects) void {
+    for (0..agent_rail.pet_slots) |slot| {
+        const index = agentPetCatalogIndex(model, slot) orelse continue;
+        const name = catalog[index].slice();
+        if (std.mem.eql(u8, agent_anim_built[slot][0..agent_anim_built_len[slot]], name) and agent_anim_ready[slot]) continue;
+        if (agent_anim_pixels.len == 0) {
+            agent_anim_pixels = boot_allocator.alloc(u8, anim_atlas_w * anim_atlas_h * 4) catch return;
+            @memset(agent_anim_pixels, 0);
+        }
+        // Remember the attempt even when the decode fails, so a broken
+        // sheet is not retried every tick.
+        @memcpy(agent_anim_built[slot][0..name.len], name);
+        agent_anim_built_len[slot] = @intCast(name.len);
+        var decoded = decodeSheetForThumb(fx, &catalog[index]) orelse {
+            agent_anim_ready[slot] = false;
+            return;
+        };
+        defer freeSheet(&decoded);
+        const rows: usize = if (decoded.height * 1536 >= decoded.width * 2288) 11 else 9;
+        const fw = decoded.width / cols;
+        const fh = decoded.height / rows;
+        for (agent_rail.anim_states, 0..) |state, state_index| {
+            const def = stateDef(state);
+            const count = agent_rail.animFrameCount(state_index);
+            for (0..count) |f| {
+                const spec = def.frames[f * def.frames.len / count];
+                downscaleFrame(decoded.pixels, decoded.width, spec.col * fw, def.row * fh, fw, fh, agent_anim_pixels, f * 48, (slot * agent_rail.anim_states.len + state_index) * 52);
+            }
+        }
+        agent_anim_ready[slot] = true;
+        fx.registerImage(agent_anim_atlas_id, anim_atlas_w, anim_atlas_h, agent_anim_pixels) catch {
+            agent_anim_ready[slot] = false;
+        };
+        return;
+    }
+}
+
 /// Boot-time resolve: scan the catalog and pick the initial pet
 /// (PETDEX_PET env > persisted settings > first found). The sheet
 /// decode itself waits for `boot`: `decodeImage` is a platform service
@@ -3072,13 +3171,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .set_agent_pet_size_claude => |fraction| setAgentPetSize(model, 0, fraction),
         .set_agent_pet_size_gemini => |fraction| setAgentPetSize(model, 1, fraction),
         .set_agent_pet_size_codex => |fraction| setAgentPetSize(model, 2, fraction),
-        .cycle_agent_pet => |slot| {
-            if (slot >= agent_rail.pet_slots or catalog_mod.catalog_len == 0) return;
-            const current = agentPetCatalogIndex(model, slot) orelse catalog_mod.catalog_len - 1;
-            const next = (current + 1) % catalog_mod.catalog_len;
-            const name = catalog[next].slice();
+        .open_agent_pet_picker => |slot| {
+            if (slot >= agent_rail.pet_slots) return;
+            model.agent_pet_picker = if (model.agent_pet_picker == slot + 1) 0 else slot + 1;
+        },
+        .close_agent_pet_picker => model.agent_pet_picker = 0,
+        .set_agent_pet => |packed_choice| {
+            const slot: usize = packed_choice >> 16;
+            const index: usize = packed_choice & 0xffff;
+            if (slot >= agent_rail.pet_slots or index >= catalog_mod.catalog_len) return;
+            const name = catalog[index].slice();
             @memcpy(model.agent_pet_name[slot][0..name.len], name);
             model.agent_pet_name_len[slot] = @intCast(name.len);
+            model.agent_pet_picker = 0;
+            saveSettings(model);
+        },
+        .reset_agent_pet => |slot| {
+            if (slot >= agent_rail.pet_slots) return;
+            model.agent_pet_name_len[slot] = 0;
+            model.agent_pet_picker = 0;
             saveSettings(model);
         },
         .toggle_section => |index| {
@@ -3373,8 +3484,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // The rail draws before any agent speaks, so its logos cannot
             // wait for the first drained bubble.
             if (railShown(model)) loadAgentsAtlas(model.dark, fx);
-            if ((model.settings_open or model.agent_pets) and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
+            if ((model.settings_open or model.agent_pets) and thumbs_built < catalog_mod.catalog_len) {
+                buildNextThumb(fx);
+            } else if (model.agent_pets) {
+                buildAgentAnim(model, fx);
+            }
             const now = fx.wallMs();
+            if (model.agent_pets) model.rail.anim_ms = @divTrunc(now, anim_tick_ms) * anim_tick_ms;
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
@@ -5148,7 +5264,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
             .label = settings_window_label,
             .canvas_label = settings_canvas_label,
             .title = "Petdex Settings",
-            .width = 420,
+            .width = 460,
             .height = 680,
             .resizable = false,
             .titlebar = .hidden_inset,
@@ -5189,6 +5305,8 @@ fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []cons
         .ready = &thumbs_ready,
         .cell_w = @floatFromInt(thumb_w),
         .cell_h = @floatFromInt(thumb_h),
+        .anim_image = agent_anim_atlas_id,
+        .anim_ready = &agent_anim_ready,
     });
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
     return settings_view.settingsView(ui, model, .{
@@ -5200,6 +5318,8 @@ fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []cons
         .ready = &thumbs_ready,
         .cell_w = @floatFromInt(thumb_w),
         .cell_h = @floatFromInt(thumb_h),
+        .anim_image = agent_anim_atlas_id,
+        .anim_ready = &agent_anim_ready,
     }, .{
         .avatar_ready = auth_avatar_ready,
         .avatar_image = auth_avatar_image_id,

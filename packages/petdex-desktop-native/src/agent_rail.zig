@@ -27,6 +27,7 @@ const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
+const sprite = @import("sprite.zig");
 const hook_server = @import("hook_server.zig");
 
 const app = @import("main.zig");
@@ -126,6 +127,8 @@ pub const Model = struct {
     pet_px: [pet_slots]f32 = @splat(default_pet_px),
     /// Thumbnail-atlas index of the pet each default row shows.
     pet_thumb: [pet_slots]?usize = @splat(null),
+    /// Wall clock, quantized by main.zig, that drives the pet animations.
+    anim_ms: i64 = 0,
 
     pub fn slice(self: *const Model) []const Entry {
         return self.entries[0..self.len];
@@ -499,7 +502,38 @@ pub const ThumbAtlas = struct {
     ready: []const bool,
     cell_w: f32,
     cell_h: f32,
+    /// Animation atlas: per Agent-Pets slot, one row of frames for each
+    /// of `anim_states`. Until a slot's pet is built the still is drawn.
+    anim_image: u64 = 0,
+    anim_ready: []const bool = &.{},
 };
+
+/// What a row's pet is doing, by status: idle, working, waiting, done.
+pub const anim_states = [_]sprite.State{ .idle, .running, .waiting, .jumping };
+pub const anim_frames_max: usize = 6;
+pub const anim_cell_w: f32 = 48;
+pub const anim_cell_h: f32 = 52;
+
+fn animStateIndex(status: Status) usize {
+    return switch (status) {
+        .idle => 0,
+        .working => 1,
+        .waiting => 2,
+        .done => 3,
+    };
+}
+
+/// Frames kept per state in the atlas; sheets with more are sampled evenly.
+pub fn animFrameCount(state_index: usize) usize {
+    return @min(sprite.stateDef(anim_states[state_index]).frames.len, anim_frames_max);
+}
+
+fn animFrame(status: Status, anim_ms: i64) usize {
+    const index = animStateIndex(status);
+    const per_frame: i64 = if (index == 0) 260 else 140;
+    const tick: usize = @intCast(@divTrunc(@max(anim_ms, 0), per_frame));
+    return tick % animFrameCount(index);
+}
 
 const RingSizes = struct { icon: f32, ring: f32, gap: f32 };
 
@@ -536,16 +570,27 @@ fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, 
 
 /// Agent-Pets row: the pet's thumbnail inside the status ring, with the
 /// agent's logo on a dark chip in the top-right corner.
-pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, thumb: usize, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
+pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, slot: usize, thumb: usize, anim_ms: i64, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
     const cell = cellOf(px, ring_px, ring_gap);
     const pad = ring_px + ring_gap;
     const ready = thumb < thumbs.ready.len and thumbs.ready[thumb];
+    const animated = slot < thumbs.anim_ready.len and thumbs.anim_ready[slot];
     var pet = ui.image(.{
         .width = px,
         .height = px,
-        .image = if (ready) thumbs.image else 0,
+        .image = if (animated) thumbs.anim_image else if (ready) thumbs.image else 0,
     });
-    pet.widget.image_src = geometry.RectF.init(@as(f32, @floatFromInt(thumb)) * thumbs.cell_w, 0, thumbs.cell_w, thumbs.cell_h);
+    if (animated) {
+        const row = slot * anim_states.len + animStateIndex(status);
+        pet.widget.image_src = geometry.RectF.init(
+            @as(f32, @floatFromInt(animFrame(status, anim_ms))) * anim_cell_w,
+            @as(f32, @floatFromInt(row)) * anim_cell_h,
+            anim_cell_w,
+            anim_cell_h,
+        );
+    } else {
+        pet.widget.image_src = geometry.RectF.init(@as(f32, @floatFromInt(thumb)) * thumbs.cell_w, 0, thumbs.cell_w, thumbs.cell_h);
+    }
     pet.widget.image_fit = .contain;
     pet.widget.image_sampling = .linear;
 
@@ -614,7 +659,7 @@ pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
     for (groups.slice(), 0..) |*group, slot| {
         const ext_h = rowCell(model, group.name) + ext_overhang * 2;
         cells[slot] = if (petPxFor(model, group.name)) |px|
-            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, model.pet_thumb[petSlot(group.name).?].?, icons, thumbs)
+            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs)
         else
             ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons);
         // Each slot is a little taller than the ring and the gaps shrink to

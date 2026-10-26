@@ -571,7 +571,10 @@ pub fn animFrameCount(state_index: usize) usize {
 
 fn animFrame(status: Status, anim_ms: i64) usize {
     const index = animStateIndex(status);
-    const per_frame: i64 = if (index == 0) 260 else 140;
+    // An idle agent has nothing to show: hold the first frame, since the
+    // idle loop blinks the sprite out and reads as the pet flashing away.
+    if (status == .idle) return 0;
+    const per_frame: i64 = 140;
     const tick: usize = @intCast(@divTrunc(@max(anim_ms, 0), per_frame));
     return tick % animFrameCount(index);
 }
@@ -1105,4 +1108,13 @@ test "settings status strip shows an agent's live threads" {
     try std.testing.expectEqualStrings("waiting for you \u{b7} 2 threads", strip.nodes[1].nodes[0].widget.text);
     const idle = statusStrip(&ui, &model, "codex", 1, test_icons);
     try std.testing.expectEqual(@as(usize, 0), idle.nodes[2].nodes.len);
+}
+
+test "idle agent pets hold a still frame" {
+    for ([_]i64{ 0, 130, 520, 5000 }) |ms| try std.testing.expectEqual(@as(usize, 0), animFrame(.idle, ms));
+    var moved = false;
+    for ([_]i64{ 0, 140, 280, 420 }) |ms| {
+        if (animFrame(.working, ms) != animFrame(.working, 0)) moved = true;
+    }
+    try std.testing.expect(moved);
 }

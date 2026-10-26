@@ -819,6 +819,8 @@ fn payloadSessionId(phase: []const u8, payload: []const u8, hash_buf: *[64]u8) ?
         "sessionID",
         "thread_id",
         "conversation_id",
+        // Antigravity names its session this way.
+        "conversationId",
     }))) |session| return session;
     if (firstJsonString(payload, &.{"session_key"})) |key|
         return normalizedConversationKey(key, hash_buf);

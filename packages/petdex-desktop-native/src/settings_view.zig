@@ -54,6 +54,8 @@ pub const ThumbAtlas = struct {
     ready: []const bool,
     cell_w: f32,
     cell_h: f32,
+    anim_image: u64 = 0,
+    anim_ready: []const bool = &.{},
 };
 
 pub const CloudImages = struct {
@@ -199,13 +201,24 @@ fn agentsSection(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
             .style_tokens = .{ .background = .surface, .radius = .md },
             .semantics = .{ .label = info.kind.displayName() },
         }, .{
-            ui.row(.{ .gap = 12, .cross = .center }, .{
-                logo,
-                ui.column(.{ .grow = 1, .main = .center }, .{
-                    ui.text(.{}, info.kind.displayName()),
-                    mutedParagraph(ui, agentStatusCaption(info, model.codex_trust_note, model.dsh_busy, model.dsh_error)),
+            ui.column(.{ .gap = 10 }, .{
+                ui.row(.{ .gap = 12, .cross = .center }, .{
+                    logo,
+                    ui.column(.{ .grow = 1, .main = .center }, .{
+                        ui.text(.{}, info.kind.displayName()),
+                        mutedParagraph(ui, agentStatusCaption(info, model.codex_trust_note, model.dsh_busy, model.dsh_error)),
+                    }),
+                    trailing,
                 }),
-                trailing,
+                if (info.status == .current)
+                    agent_rail.statusStrip(ui, &model.rail, info.kind.hookAgentName(), i, .{
+                        .ready = icons.ready,
+                        .image = icons.image,
+                        .rect = icons.rect,
+                        .index = &app.agentIconIndex,
+                    })
+                else
+                    ui.el(.stack, .{}, .{}),
             }),
         });
         count += 1;
@@ -484,6 +497,7 @@ fn thumbImage(ui: *AppUi, thumbs: ThumbAtlas, i: usize, label: []const u8, w: f3
 }
 
 var delete_label_buf: [128]u8 = undefined;
+var portrait_no_buf: [12]u8 = undefined;
 
 /// One big framed portrait of the active pet. Pressing the frame opens
 /// the picker; there is no list on the main page any more.
@@ -504,7 +518,8 @@ fn petPortrait(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas) AppUi.Node {
     }, .{
         ui.column(.{ .grow = 1, .gap = 8, .cross = .center }, .{
             portrait,
-            ui.text(.{}, name),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (have) (std.fmt.bufPrint(&portrait_no_buf, "No. {d:0>3}", .{model.active_pet + 1}) catch "No.") else ""),
+            ui.text(.{ .size = .lg }, name),
         }),
     });
     return ui.column(.{ .gap = 8 }, .{
@@ -573,22 +588,195 @@ fn petsTop(ui: *AppUi, model: *const Model, filter: []const u8) AppUi.Node {
     });
 }
 
+// ------------------------------------------------------------- Pokedex look
+//
+// The settings window is a handheld dex: a red shell, a blue lens and
+// three LEDs up top, and every panel an LCD with phosphor-green text.
+// `dexify` restyles the finished tree instead of every call site.
+
+const Color = canvas.Color;
+const dex_text = Color.rgb8(176, 248, 200);
+const dex_muted = Color.rgb8(108, 178, 140);
+const dex_lcd_edge = Color.rgb8(5, 20, 16);
+const dex_lens = Color.rgb8(48, 138, 238);
+const dex_selected = Color.rgb8(30, 92, 66);
+
+pub fn dexShell(model: *const Model) Color {
+    return if (model.dark) Color.rgb8(104, 14, 26) else Color.rgb8(192, 28, 46);
+}
+
+fn dexShellDark(model: *const Model) Color {
+    return if (model.dark) Color.rgb8(70, 8, 18) else Color.rgb8(140, 18, 34);
+}
+
+fn dexLcd(model: *const Model) Color {
+    return if (model.dark) Color.rgb8(13, 36, 30) else Color.rgb8(20, 48, 40);
+}
+
+fn dexify(model: *const Model, node: *AppUi.Node) void {
+    switch (node.widget.kind) {
+        .panel, .list_item => if (node.style_tokens.background) |ref| {
+            if (ref == .surface) {
+                node.widget.style.background = dexLcd(model);
+                node.widget.style.border = dex_lcd_edge;
+                node.widget.style.stroke_width = 2;
+            }
+        },
+        .text => {
+            if (node.style_tokens.foreground) |ref| {
+                node.widget.style.foreground = if (ref == .text_muted) dex_muted else dex_text;
+            } else if (node.widget.style.foreground == null) {
+                node.widget.style.foreground = dex_text;
+            }
+        },
+        else => {},
+    }
+    // The tree is arena-built and still ours; Node only exposes children
+    // as const.
+    for (@constCast(node.nodes)) |*child| dexify(model, child);
+}
+
+fn dexLed(ui: *AppUi, color: Color) AppUi.Node {
+    var led = ui.el(.panel, .{ .width = 12, .height = 12 }, .{});
+    led.widget.style.radius = 6;
+    led.widget.style.background = color;
+    led.widget.style.border = dex_lcd_edge;
+    led.widget.style.stroke_width = 1.5;
+    return led;
+}
+
+/// The dex's blue lens with its glint, and the three indicator LEDs.
+fn dexTopBar(ui: *AppUi, model: *const Model) AppUi.Node {
+    var glint = ui.el(.panel, .{ .width = 9, .height = 9 }, .{});
+    glint.widget.style.radius = 4.5;
+    glint.widget.style.background = Color.rgba8(255, 255, 255, 170);
+    glint.widget.frame.x = 5;
+    glint.widget.frame.y = 4;
+    var inner = ui.el(.panel, .{ .width = 30, .height = 30 }, .{glint});
+    inner.widget.style.radius = 15;
+    inner.widget.style.background = dex_lens;
+    var lens = ui.el(.panel, .{ .width = 44, .height = 44, .padding = 7 }, .{inner});
+    lens.widget.style.radius = 22;
+    lens.widget.style.background = Color.rgb8(240, 244, 248);
+    lens.widget.style.border = dex_lcd_edge;
+    lens.widget.style.stroke_width = 2;
+    var title = ui.text(.{ .size = .lg }, "PETDEX");
+    title.widget.style.foreground = Color.rgb8(255, 255, 255);
+    var bar = ui.row(.{ .padding = 12, .gap = 10, .cross = .center }, .{
+        lens,
+        dexLed(ui, Color.rgb8(239, 68, 68)),
+        dexLed(ui, Color.rgb8(250, 204, 21)),
+        dexLed(ui, Color.rgb8(34, 197, 94)),
+        ui.el(.stack, .{ .grow = 1 }, .{}),
+        title,
+    });
+    bar.widget.style.background = dexShellDark(model);
+    return bar;
+}
+
+const dex_cols: usize = 3;
+const dex_max_rows: usize = max_catalog / dex_cols + 1;
+const dex_visible: usize = 9;
+var dex_labels: [max_catalog][12]u8 = undefined;
+
+const DexGrid = struct {
+    rows: [dex_max_rows]AppUi.Node = undefined,
+    row_count: usize = 0,
+    matches: usize = 0,
+    shown: usize = 0,
+};
+
+/// The collection as a dex page: numbered cards, three to a row, the
+/// current pick lit. With `slot` set it picks that agent's pet instead of
+/// the main one, and the delete buttons stay out of the way.
+fn dexGrid(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, filter: []const u8, slot: ?usize) DexGrid {
+    var grid: DexGrid = .{};
+    var cards: [max_catalog]AppUi.Node = undefined;
+    const max_visible: usize = if (model.pets_expanded) max_catalog else dex_visible;
+    const current: ?usize = if (slot) |sl| app.agentPetCatalogIndex(model, sl) else if (model.active_pet < catalog_mod.catalog_len) model.active_pet else null;
+    for (catalog[0..@min(catalog_mod.catalog_len, max_catalog)], 0..) |*entry, i| {
+        if (!petMatchesFilter(entry.slice(), filter)) continue;
+        grid.matches += 1;
+        if (grid.shown >= max_visible) continue;
+        const deletable = slot == null and std.mem.eql(u8, entry.rootSlice(), installer.install_roots[0]);
+        const press: Msg = if (slot) |sl|
+            Msg{ .set_agent_pet = @intCast((sl << 16) | i) }
+        else
+            Msg{ .select_pet = @intCast(i) };
+        const number = std.fmt.bufPrint(&dex_labels[i], "No. {d:0>3}", .{i + 1}) catch "No.";
+        var card = ui.el(.list_item, .{
+            .grow = 1,
+            .height = if (deletable) 150 else 124,
+            .padding = 8,
+            .main = .center,
+            .cross = .center,
+            .on_press = press,
+            .style_tokens = .{ .background = .surface, .radius = .md },
+            .semantics = .{ .label = entry.slice() },
+        }, .{
+            ui.column(.{ .gap = 4, .cross = .center }, .{
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, number),
+                thumbImage(ui, thumbs, i, entry.slice(), 64, 70),
+                ui.text(.{ .size = .sm }, entry.slice()),
+                if (deletable)
+                    ui.button(.{ .size = .sm, .width = 32, .variant = .secondary, .on_press = Msg{ .ask_delete_pet = @intCast(i) } }, "X")
+                else
+                    ui.el(.stack, .{}, .{}),
+            }),
+        });
+        if (current != null and current.? == i) {
+            card.style_tokens.background = null;
+            card.widget.style.background = dex_selected;
+            card.widget.style.border = dex_text;
+            card.widget.style.stroke_width = 2;
+        }
+        cards[grid.shown] = card;
+        grid.shown += 1;
+    }
+    var at: usize = 0;
+    while (at < grid.shown) : (at += dex_cols) {
+        const end = @min(at + dex_cols, grid.shown);
+        var row_cards: [dex_cols]AppUi.Node = undefined;
+        for (0..dex_cols) |k| {
+            row_cards[k] = if (at + k < end) cards[at + k] else ui.el(.stack, .{ .grow = 1 }, .{});
+        }
+        grid.rows[grid.row_count] = ui.row(.{ .gap = 8 }, @as([]const AppUi.Node, &row_cards));
+        grid.row_count += 1;
+    }
+    return grid;
+}
+
+/// "Show all" / "Show less" under a grid, when it truncates.
+fn dexMore(ui: *AppUi, grid: *const DexGrid) AppUi.Node {
+    if (grid.matches > grid.shown) return ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, moreLabel(grid.matches));
+    if (grid.shown > dex_visible) return ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, "Show less");
+    if (grid.matches == 0) return ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "No installed pets match");
+    return ui.el(.stack, .{}, .{});
+}
+
 /// A section header that folds its body away. The body is built either
 /// way; only an open section lays it out.
 fn collapsible(ui: *AppUi, model: *const Model, section: app.Section, title: []const u8, body: AppUi.Node) AppUi.Node {
     const open = app.sectionOpen(model, section);
-    const header = ui.el(.list_item, .{
+    var name = ui.text(.{ .size = .lg }, title);
+    name.widget.style.foreground = Color.rgb8(255, 255, 255);
+    var state = ui.text(.{ .size = .sm }, if (open) "Hide" else "Show");
+    state.widget.style.foreground = Color.rgb8(255, 214, 220);
+    var header = ui.el(.list_item, .{
         .height = 40,
         .padding = 10,
         .gap = 8,
         .cross = .center,
         .on_press = Msg{ .toggle_section = @intFromEnum(section) },
-        .style_tokens = .{ .background = .surface, .radius = .md },
+        .style_tokens = .{ .radius = .md },
         .semantics = .{ .label = title },
     }, .{
-        ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .lg }, title)}),
-        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (open) "Hide" else "Show"),
+        ui.column(.{ .grow = 1 }, .{name}),
+        state,
     });
+    header.widget.style.background = dexShellDark(model);
+    header.widget.style.border = dex_lcd_edge;
+    header.widget.style.stroke_width = 2;
     return ui.column(.{ .gap = 8 }, .{
         header,
         if (open) body else ui.el(.stack, .{}, .{}),
@@ -599,19 +787,19 @@ const agent_pet_labels = [_][]const u8{ "Claude Code", "Antigravity", "Codex" };
 const agent_pet_hooks = [_][]const u8{ "claude-code", "gemini", "codex" };
 
 /// One mini portrait: the pet inside its status ring with the agent logo
-/// in the corner, exactly as the tab draws it. Pressing it moves on to
-/// the next installed pet; the slider below resizes it.
+/// in the corner, exactly as the tab draws it. Pressing it opens the
+/// collection to choose from; the slider below resizes it.
 fn agentPetCard(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, slot: usize, on_size: @TypeOf(AppUi.valueMsg(.set_scale))) AppUi.Node {
     const px = std.math.clamp(model.agent_pet_px[slot], agent_rail.min_pet_px, agent_rail.max_pet_px);
     const index = app.agentPetCatalogIndex(model, slot);
     const name: []const u8 = if (index) |i| catalog[i].slice() else "No pet";
     const preview: AppUi.Node = if (index) |i|
-        agent_rail.ringedPet(ui, agent_pet_hooks[slot], .idle, agent_pet_labels[slot], px, i, .{
+        agent_rail.ringedPet(ui, agent_pet_hooks[slot], .idle, agent_pet_labels[slot], px, slot, i, model.rail.anim_ms, .{
             .ready = icons.ready,
             .image = icons.image,
             .rect = icons.rect,
             .index = &app.agentIconIndex,
-        }, .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h })
+        }, .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h, .anim_image = thumbs.anim_image, .anim_ready = thumbs.anim_ready }, null)
     else
         ui.el(.stack, .{ .width = px, .height = px }, .{});
     const fraction: f32 = (px - agent_rail.min_pet_px) / (agent_rail.max_pet_px - agent_rail.min_pet_px);
@@ -622,7 +810,7 @@ fn agentPetCard(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
             .padding = 6,
             .main = .center,
             .cross = .center,
-            .on_press = Msg{ .cycle_agent_pet = @intCast(slot) },
+            .on_press = Msg{ .open_agent_pet_picker = @intCast(slot) },
             .style_tokens = .{ .background = .surface, .radius = .md },
             .semantics = .{ .label = name },
         }, .{preview}),
@@ -632,14 +820,35 @@ fn agentPetCard(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
     });
 }
 
+fn agentPetPicker(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, slot: usize) AppUi.Node {
+    const grid = dexGrid(ui, model, thumbs, model.pet_filter[0..model.pet_filter_len], slot);
+    return ui.column(.{ .gap = 8 }, .{
+        ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .lg }, agent_pet_labels[slot])}),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = Msg{ .reset_agent_pet = @intCast(slot) } }, "Same as main pet"),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .close_agent_pet_picker }, "Back"),
+        }),
+        ui.el(.search_field, .{
+            .height = 34,
+            .text = model.pet_filter[0..model.pet_filter_len],
+            .on_input = AppUi.inputMsg(.pet_filter),
+            .placeholder = "Search pets",
+            .semantics = .{ .label = "Search pets" },
+        }, .{}),
+        ui.column(.{ .gap = 8 }, @as([]const AppUi.Node, grid.rows[0..grid.row_count])),
+        dexMore(ui, &grid),
+    });
+}
+
 fn agentPetsSection(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
+    if (model.agent_pet_picker != 0) return agentPetPicker(ui, model, thumbs, model.agent_pet_picker - 1);
     return ui.column(.{ .gap = 8 }, .{
         ui.row(.{ .gap = 8, .cross = .start }, .{
             agentPetCard(ui, model, icons, thumbs, 0, AppUi.valueMsg(.set_agent_pet_size_claude)),
             agentPetCard(ui, model, icons, thumbs, 1, AppUi.valueMsg(.set_agent_pet_size_gemini)),
             agentPetCard(ui, model, icons, thumbs, 2, AppUi.valueMsg(.set_agent_pet_size_codex)),
         }),
-        mutedParagraph(ui, "Click a portrait to switch that agent's pet; drag its slider to resize it"),
+        mutedParagraph(ui, "Click a portrait to choose that agent's pet from your collection; drag its slider to resize it"),
     });
 }
 
@@ -647,36 +856,11 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
     var rows: [max_catalog]AppUi.Node = undefined;
     var shown: usize = 0;
     var matches: usize = 0;
-    const max_visible: usize = if (model.pet_source == .installed and model.pets_expanded) max_catalog else 6;
+    const max_visible: usize = if (model.pets_expanded) max_catalog else 6;
     const filter = model.pet_filter[0..model.pet_filter_len];
+    var grid: DexGrid = .{};
     if (model.pet_source == .installed) {
-        for (catalog[0..@min(catalog_mod.catalog_len, max_catalog)], 0..) |*entry, i| {
-            if (i == model.active_pet) continue;
-            if (!petMatchesFilter(entry.slice(), filter)) continue;
-            matches += 1;
-            if (shown >= max_visible) continue;
-            const deletable = std.mem.eql(u8, entry.rootSlice(), installer.install_roots[0]);
-            rows[shown] = ui.el(.list_item, .{
-                .height = 56,
-                .padding = 8,
-                .gap = 12,
-                .cross = .center,
-                .on_press = Msg{ .select_pet = @intCast(i) },
-                .style_tokens = .{ .background = .surface, .radius = .md },
-                .semantics = .{ .label = entry.slice() },
-            }, .{
-                thumbImage(ui, thumbs, i, entry.slice(), 40, 44),
-                ui.column(.{ .grow = 1, .main = .center }, .{
-                    ui.text(.{}, entry.slice()),
-                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, entry.rootSlice()),
-                }),
-                if (deletable)
-                    ui.button(.{ .size = .sm, .width = 32, .variant = .secondary, .on_press = Msg{ .ask_delete_pet = @intCast(i) } }, "X")
-                else
-                    ui.el(.stack, .{}, .{}),
-            });
-            shown += 1;
-        }
+        if (model.pet_picker_open) grid = dexGrid(ui, model, thumbs, filter, null);
     } else {
         const pets = if (model.pet_source == .yours) model.auth.owned[0..model.auth.owned_len] else model.auth.caught[0..model.auth.caught_len];
         for (pets, 0..) |*pet, i| {
@@ -712,22 +896,25 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
     });
     // One scrollable page of collapsible sections: the root scroll takes
     // the window frame and every group folds down to its header.
-    const page = ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{ui.column(.{ .padding = 12, .gap = 10 }, .{
+    var page = ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{ui.column(.{ .padding = 12, .gap = 10 }, .{
         collapsible(ui, model, .pet, "Pet", ui.column(.{ .gap = 10 }, .{
             cloudLibrarySection(ui, model, cloud_images),
             if (model.pet_picker_open) petsTop(ui, model, filter) else petPortrait(ui, model, thumbs),
             if (model.pet_picker_open) deleteConfirm(ui, model) else ui.el(.stack, .{}, .{}),
-            if (model.pet_picker_open) ui.column(.{ .gap = 6 }, @as([]const AppUi.Node, rows[0..shown])) else ui.el(.stack, .{}, .{}),
             if (!model.pet_picker_open)
                 ui.el(.stack, .{}, .{})
-            else if (model.pet_source == .installed and matches > shown)
-                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, moreLabel(matches))
-            else if (model.pet_source == .installed and model.pets_expanded and matches > 6)
-                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, "Show less")
-            else if (model.pet_source != .installed and matches > shown)
+            else if (model.pet_source == .installed)
+                ui.column(.{ .gap = 8 }, @as([]const AppUi.Node, grid.rows[0..grid.row_count]))
+            else
+                ui.column(.{ .gap = 6 }, @as([]const AppUi.Node, rows[0..shown])),
+            if (!model.pet_picker_open)
+                ui.el(.stack, .{}, .{})
+            else if (model.pet_source == .installed)
+                dexMore(ui, &grid)
+            else if (matches > shown)
                 ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_open_library }, "Open all on Petdex")
             else if (matches == 0)
-                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (model.pet_source == .installed) "No other installed pets match" else "No pets match your search")
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "No pets match your search")
             else
                 ui.el(.stack, .{}, .{}),
         })),
@@ -932,12 +1119,14 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         // of the scroll extent, so the last card needs explicit air.
         ui.el(.stack, .{ .height = 8 }, .{}),
     })});
+    dexify(model, &page);
     const content = ui.column(.{ .grow = 1 }, .{
         ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
+        dexTopBar(ui, model),
         page,
     });
     var root = ui.panel(.{ .grow = 1 }, .{content});
-    root.widget.style.background = settingsBackground(model);
+    root.widget.style.background = dexShell(model);
     root.widget.style.radius = 0;
     root.widget.style.stroke_width = 0;
     return root;

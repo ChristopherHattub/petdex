@@ -1090,6 +1090,19 @@ pub fn activateOriginApplication(origin: OriginApplication, source_tty: []const 
     return spawnAndWait(&.{ "/usr/bin/open", "-b", bundle_id });
 }
 
+/// Bring a desktop agent app forward by name (`open -a`), optionally
+/// opening the session's folder in it so an editor surfaces that
+/// workspace's window.
+pub fn activateAppByName(app_name: []const u8, folder: ?[]const u8) bool {
+    if (builtin.os.tag != .macos) return false;
+    if (folder) |dir| {
+        if (safeSourceCwd(dir)) |safe| {
+            if (spawnAndWait(&.{ "/usr/bin/open", "-a", app_name, safe })) return true;
+        }
+    }
+    return spawnAndWait(&.{ "/usr/bin/open", "-a", app_name });
+}
+
 // ------------------------------------------------------- app presence
 
 /// The objc-runtime and libdispatch surface needed to flip the Dock

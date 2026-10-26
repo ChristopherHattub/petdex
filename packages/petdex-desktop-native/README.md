@@ -87,7 +87,9 @@ sessions stay for ten minutes, then drop off. The tab moves to the left of
 the pet near the right screen edge and stays visible in Focus Mode. macOS and
 Windows only for now. Code: `src/agent_rail.zig`.
 
-**Agent-Pets.** Settings > Appearance > Agent-Pets swaps the Claude Code, Antigravity and Codex logos for mini pets inside the same status ring, with the agent logo small in the top-right corner. A new "Agent-Pets" section appears under Pet with one portrait per agent: click it to switch that agent's pet, and use its slider to resize it. Settings are grouped into collapsible sections.
+**Agent-Pets.** Settings > Appearance > Agent-Pets swaps the Claude Code, Antigravity and Codex logos for mini pets inside the same status ring, with the agent logo small in the top-right corner. A new "Agent-Pets" section appears under Pet with one portrait per agent: click it to switch that agent's pet, and use its slider to resize it. Settings are grouped into collapsible sections. The mini pets animate with the agent's status (idle, working, waiting, done); clicking a portrait opens your collection to pick that agent's pet. Settings is styled as a handheld dex.
+
+Clicking an icon in the tab jumps to that session: its Herdr pane, then the terminal or editor it reported, then the agent's own app (Claude, Antigravity, Codex). A session that has gone quiet for under five minutes still reads as working.
 
 ## Updating this fork (macOS)
 

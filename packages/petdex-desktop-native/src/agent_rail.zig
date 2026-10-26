@@ -28,10 +28,12 @@ const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const sprite = @import("sprite.zig");
+const plat = @import("plat.zig");
 const hook_server = @import("hook_server.zig");
 
 const app = @import("main.zig");
 const AppUi = app.AppUi;
+const Msg = app.Msg;
 
 pub const window_label = "agent-rail";
 pub const canvas_label = "agent-rail-canvas";
@@ -84,12 +86,29 @@ pub const Entry = struct {
     hostname: [64]u8 = @splat(0),
     hostname_len: usize = 0,
     remote: bool = false,
+    /// Where the session lives, for jumping back to it from the tab.
+    origin_app: plat.OriginApplication = .none,
+    tty: [64]u8 = @splat(0),
+    tty_len: usize = 0,
+    cwd: [512]u8 = @splat(0),
+    cwd_len: usize = 0,
+    herdr_pane: [64]u8 = @splat(0),
+    herdr_pane_len: usize = 0,
     status: Status = .idle,
     /// When `status` last changed. Drives the linger for settled entries.
     since_ms: i64 = 0,
 
     pub fn agentSlice(self: *const Entry) []const u8 {
         return self.agent[0..self.agent_len];
+    }
+    pub fn ttySlice(self: *const Entry) []const u8 {
+        return self.tty[0..self.tty_len];
+    }
+    pub fn cwdSlice(self: *const Entry) []const u8 {
+        return self.cwd[0..self.cwd_len];
+    }
+    pub fn herdrPaneSlice(self: *const Entry) []const u8 {
+        return self.herdr_pane[0..self.herdr_pane_len];
     }
     pub fn sessionSlice(self: *const Entry) []const u8 {
         return self.session[0..self.session_len];
@@ -148,6 +167,26 @@ fn copyInto(dest: []u8, dest_len: *usize, source: []const u8) void {
 /// ages out, rather than spinning red forever.
 ///
 /// Returns the transitions in `out`, newest state per entry.
+fn copyOrigin(entry: *Entry, bubble: *const hook_server.Bubble) void {
+    entry.origin_app = bubble.origin_app;
+    copyInto(&entry.tty, &entry.tty_len, bubble.ttySlice());
+    copyInto(&entry.cwd, &entry.cwd_len, bubble.cwdSlice());
+    copyInto(&entry.herdr_pane, &entry.herdr_pane_len, bubble.herdrPaneSlice());
+}
+
+/// How long a running session that has gone quiet still counts as working
+/// on the tab. The mailbox quiets a card after 30 seconds without
+/// meaningful activity, but agents such as Gemini and Antigravity can sit
+/// in one long model call that emits nothing; showing those as idle made
+/// the ring look stuck.
+const quiet_working_ms: i64 = 5 * 60 * 1000;
+
+fn statusOf(bubble: *const hook_server.Bubble, now_ms: i64) Status {
+    if (bubble.stale_running_suppressed and bubble.last_meaningful_activity_ms > 0 and
+        now_ms - bubble.last_meaningful_activity_ms < quiet_working_ms) return .working;
+    return Status.fromSession(bubble.status, bubble.busy);
+}
+
 pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64, out: *[max_entries]Transition) usize {
     var seen: [max_entries]bool = @splat(false);
     var transitions: usize = 0;
@@ -155,7 +194,7 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
     for (bubbles) |*bubble| {
         // The anonymous compatibility slot has no stable identity to ring.
         if (bubble.agent_len == 0) continue;
-        const next = Status.fromSession(bubble.status, bubble.busy);
+        const next = statusOf(bubble, now_ms);
         const index = indexOf(model, bubble.identity()) orelse blk: {
             if (model.len == max_entries) {
                 if (!evictOldestSettled(model, &seen)) continue;
@@ -165,6 +204,7 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
             copyInto(&entry.agent, &entry.agent_len, bubble.agent[0..bubble.agent_len]);
             copyInto(&entry.hostname, &entry.hostname_len, bubble.hostnameSlice());
             entry.remote = bubble.remote;
+            copyOrigin(&entry, bubble);
             entry.status = next;
             entry.since_ms = now_ms;
             model.entries[model.len] = entry;
@@ -178,6 +218,7 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
         seen[index] = true;
         const entry = &model.entries[index];
         copyInto(&entry.agent, &entry.agent_len, bubble.agent[0..bubble.agent_len]);
+        copyOrigin(entry, bubble);
         if (entry.status != next) {
             if (transitions < max_entries) {
                 out[transitions] = .{ .index = index, .from = entry.status, .to = next };
@@ -540,7 +581,7 @@ const RingSizes = struct { icon: f32, ring: f32, gap: f32 };
 const main_sizes: RingSizes = .{ .icon = icon_px, .ring = ring_px, .gap = ring_gap };
 const mini_sizes: RingSizes = .{ .icon = mini_icon_px, .ring = mini_ring_px, .gap = mini_ring_gap };
 
-fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, sizes: RingSizes, icons: IconAtlas) AppUi.Node {
+fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, sizes: RingSizes, icons: IconAtlas, press: ?Msg) AppUi.Node {
     const cell = sizes.icon + (sizes.ring + sizes.gap) * 2;
     const glyph = if (icons.ready) blk: {
         var image = ui.image(.{ .width = sizes.icon, .height = sizes.icon, .image = icons.image });
@@ -559,6 +600,7 @@ fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, 
         .padding = sizes.ring + sizes.gap,
         .main = .center,
         .cross = .center,
+        .on_press = press,
         .semantics = .{ .label = label },
     }, .{glyph});
     ring.widget.style.radius = cell / 2;
@@ -570,7 +612,7 @@ fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, 
 
 /// Agent-Pets row: the pet's thumbnail inside the status ring, with the
 /// agent's logo on a dark chip in the top-right corner.
-pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, slot: usize, thumb: usize, anim_ms: i64, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
+pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, slot: usize, thumb: usize, anim_ms: i64, icons: IconAtlas, thumbs: ThumbAtlas, press: ?Msg) AppUi.Node {
     const cell = cellOf(px, ring_px, ring_gap);
     const pad = ring_px + ring_gap;
     const ready = thumb < thumbs.ready.len and thumbs.ready[thumb];
@@ -615,6 +657,7 @@ pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u
         .width = cell,
         .height = cell,
         .padding = pad,
+        .on_press = press,
         .semantics = .{ .label = label },
     }, .{ pet, chip });
     ring.widget.style.radius = cell / 2;
@@ -622,6 +665,23 @@ pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u
     ring.widget.style.border = ringColor(status);
     ring.widget.style.stroke_width = ring_px;
     return ring;
+}
+
+/// The session a tap on a row's main icon should reach: the most urgent
+/// one, so a waiting agent wins over a working one.
+fn focusTarget(model: *const Model, group: *const Group) ?usize {
+    var best: ?usize = null;
+    for (group.members[0..group.count]) |member| {
+        if (best == null or urgency(model.entries[member].status) > urgency(model.entries[best.?].status)) best = member;
+    }
+    return best;
+}
+
+/// Remote sessions have no window on this Mac to jump to.
+fn focusMsg(model: *const Model, index: ?usize) ?Msg {
+    const i = index orelse return null;
+    if (model.entries[i].remote) return null;
+    return Msg{ .focus_rail_session = @intCast(i) };
 }
 
 fn styleTab(node: *AppUi.Node, radius: f32) void {
@@ -638,7 +698,7 @@ fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: Ico
     var minis: [max_entries]AppUi.Node = undefined;
     for (group.members[0..group.count], 0..) |member, i| {
         const entry = &model.entries[member];
-        minis[i] = ringedIcon(ui, entry.agentSlice(), entry.status, memberLabel(entry, member), mini_sizes, icons);
+        minis[i] = ringedIcon(ui, entry.agentSlice(), entry.status, memberLabel(entry, member), mini_sizes, icons, focusMsg(model, member));
     }
     var panel = ui.el(.panel, .{
         .width = extWidth(group.count),
@@ -659,9 +719,9 @@ pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
     for (groups.slice(), 0..) |*group, slot| {
         const ext_h = rowCell(model, group.name) + ext_overhang * 2;
         cells[slot] = if (petPxFor(model, group.name)) |px|
-            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs)
+            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs, focusMsg(model, focusTarget(model, group)))
         else
-            ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons);
+            ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons, focusMsg(model, focusTarget(model, group)));
         // Each slot is a little taller than the ring and the gaps shrink to
         // match, so the extension overhangs the row without moving it.
         const body = if (group.count > 1)
@@ -971,4 +1031,23 @@ test "Agent-Pets sizes rows by the pet and leaves other agents on the logo" {
     // A pet row carries the thumbnail and the corner logo chip.
     try std.testing.expectEqual(@as(usize, 2), column.nodes[0].nodes.len);
     try std.testing.expectEqual(ringColor(.idle), column.nodes[0].widget.style.border);
+}
+
+test "tab icons jump to their session and quiet running sessions stay working" {
+    var model = testModel(&.{});
+    var bubble = testBubble("s1", "claude-code", .running);
+    bubble.stale_running_suppressed = true;
+    bubble.status = .idle;
+    bubble.busy = false;
+    bubble.last_meaningful_activity_ms = 1000;
+    try std.testing.expectEqual(Status.working, statusOf(&bubble, 1000 + 60 * 1000));
+    try std.testing.expectEqual(Status.idle, statusOf(&bubble, 1000 + quiet_working_ms + 1));
+
+    var edges: [max_entries]Transition = undefined;
+    _ = reconcile(&model, &.{testBubble("s1", "antigravity", .running)}, 0, &edges);
+    const entry = &model.entries[0];
+    try std.testing.expectEqual(@as(u16, 0), focusMsg(&model, 0).?.focus_rail_session);
+    entry.remote = true;
+    try std.testing.expect(focusMsg(&model, 0) == null);
+    try std.testing.expect(focusMsg(&model, null) == null);
 }

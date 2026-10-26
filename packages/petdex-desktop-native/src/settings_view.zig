@@ -788,7 +788,7 @@ fn agentPetCard(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
             .image = icons.image,
             .rect = icons.rect,
             .index = &app.agentIconIndex,
-        }, .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h, .anim_image = thumbs.anim_image, .anim_ready = thumbs.anim_ready })
+        }, .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h, .anim_image = thumbs.anim_image, .anim_ready = thumbs.anim_ready }, null)
     else
         ui.el(.stack, .{ .width = px, .height = px }, .{});
     const fraction: f32 = (px - agent_rail.min_pet_px) / (agent_rail.max_pet_px - agent_rail.min_pet_px);

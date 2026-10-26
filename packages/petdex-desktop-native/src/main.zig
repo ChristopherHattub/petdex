@@ -119,6 +119,8 @@ pub const Msg = union(enum) {
     toggle_focus_mode,
     toggle_rotate_pets,
     toggle_agent_pets,
+    /// Index into the rail's entries: jump to that session's chat.
+    focus_rail_session: u16,
     set_agent_pet_size_claude: f32,
     set_agent_pet_size_gemini: f32,
     set_agent_pet_size_codex: f32,
@@ -3164,6 +3166,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .shuffle_pet => advancePet(model, fx),
         .quit_app => plat.requestQuit(),
+        .focus_rail_session => |index| {
+            if (index >= model.rail.len) return;
+            _ = activateRailSession(&model.rail.entries[index]);
+        },
         .toggle_agent_pets => {
             model.agent_pets = !model.agent_pets;
             saveSettings(model);
@@ -4304,6 +4310,25 @@ fn activateBubbleOrigin(bubble: *const hook_server.Bubble) bool {
         if (plat.activateHerdrPane(home, bubble.herdrPaneSlice())) return true;
     }
     return plat.activateOriginApplication(bubble.origin_app, bubble.ttySlice(), bubble.cwdSlice());
+}
+
+/// Take the user to the session behind a tab icon. Best signal first: the
+/// Herdr pane, then the terminal or editor the hook reported, then the
+/// agent's own desktop app, since an agent running inside an app (Claude,
+/// Antigravity, Codex) reports no terminal at all.
+fn activateRailSession(entry: *const agent_rail.Entry) bool {
+    if (entry.remote) return false;
+    if (env_home) |home| {
+        if (entry.herdr_pane_len > 0 and plat.activateHerdrPane(home, entry.herdrPaneSlice())) return true;
+    }
+    if (entry.origin_app != .none and plat.activateOriginApplication(entry.origin_app, entry.ttySlice(), entry.cwdSlice())) return true;
+    const kind = agentKindForName(entry.agentSlice()) orelse return false;
+    switch (kind) {
+        .claude_code => return plat.activateAppByName("Claude", null),
+        .gemini => return plat.activateAppByName("Antigravity", entry.cwdSlice()),
+        .codex => return plat.activateAppByName("Codex", null) or plat.activateAppByName("ChatGPT", null),
+        else => return false,
+    }
 }
 
 fn focusNewestBubble(model: *Model, activate: *const fn (*const hook_server.Bubble) bool) bool {

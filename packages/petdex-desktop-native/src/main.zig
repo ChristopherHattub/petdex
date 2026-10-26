@@ -153,6 +153,8 @@ pub const Msg = union(enum) {
     download_update,
     copy_brew_command,
     brew_command_copied: native_sdk.EffectClipboardResult,
+    update_fork,
+    fork_update_done: native_sdk.EffectExit,
     auth_sign_in,
     auth_refresh,
     auth_sign_out,
@@ -168,7 +170,7 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "fork_update_done", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
 };
 
 pub const Model = struct {
@@ -348,6 +350,8 @@ pub const Model = struct {
     update_cancel_pending: bool = false,
     update_restart_after_cancel: bool = false,
     brew_command_copied: bool = false,
+    /// "Update my fork" could not start the updater in Terminal.
+    fork_update_failed: bool = false,
     agents_prompted: bool = false,
     codex_trust_note: bool = false,
     pet_filter: [48]u8 = @splat(0),
@@ -924,6 +928,9 @@ const update_boot_timer_key: u64 = 33;
 const homebrew_timeout_timer_key: u64 = 34;
 const dsh_install_key: u64 = 35;
 const dsh_remove_key: u64 = 36;
+const fork_update_key: u64 = 37;
+/// Where install-fork-macos.sh clones the fork; relative to $HOME.
+pub const fork_update_script = "src/petdex/scripts/update-fork-macos.command";
 const auth_token_key: u64 = 43;
 const auth_library_key: u64 = 44;
 const auth_avatar_key: u64 = 45;
@@ -2796,6 +2803,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .download_update => plat.openExternal(updates.downloadUrl()),
+        .update_fork => {
+            // Hands off to Terminal: the updater quits and replaces this
+            // app, so it cannot be our child. `open` returns at once.
+            model.fork_update_failed = true;
+            if (builtin.os.tag != .macos) return;
+            const home = env_home orelse return;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, fork_update_script }) catch return;
+            if (!plat.fileExists(path)) return;
+            model.fork_update_failed = false;
+            fx.spawn(.{
+                .key = fork_update_key,
+                .argv = &.{ "/usr/bin/open", path },
+                .output = .collect,
+                .on_exit = Effects.exitMsg(.fork_update_done),
+            });
+        },
+        .fork_update_done => |exit| {
+            model.fork_update_failed = !(exit.reason == .exited and exit.code == 0);
+        },
         .copy_brew_command => {
             model.brew_command_copied = false;
             fx.writeClipboard(.{

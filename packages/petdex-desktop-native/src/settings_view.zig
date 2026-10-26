@@ -316,7 +316,8 @@ fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     warning.widget.style.background = if (model.dark) canvas.Color.rgb8(48, 38, 22) else canvas.Color.rgb8(255, 246, 214);
     return ui.column(.{ .gap = 12 }, .{
-        ui.text(.{ .size = .lg }, "Updates"),
+        ui.text(.{ .size = .lg }, "Original Petdex updates"),
+        mutedParagraph(ui, "Checks the original Petdex project's releases, not your fork. Don't install an upstream update over your fork."),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
@@ -340,6 +341,31 @@ fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
         }),
         warning,
+        forkSection(ui, model),
+    });
+}
+
+/// The fork's own updater: pulls ChristopherHattub/petdex, rebuilds, and
+/// reinstalls, in a Terminal window so progress and errors are visible.
+fn forkSection(ui: *AppUi, model: *const Model) AppUi.Node {
+    const supported = builtin.os.tag == .macos;
+    const note = if (!supported)
+        "The fork updater runs on macOS only."
+    else if (model.fork_update_failed)
+        "Couldn't start the updater. It expects the fork in ~/src/petdex; run scripts/install-fork-macos.sh there once."
+    else
+        "Pulls your fork, rebuilds, reinstalls and relaunches Petdex in a Terminal window. Your pets and settings are kept.";
+    return ui.column(.{ .gap = 12 }, .{
+        ui.text(.{ .size = .lg }, "My fork updates"),
+        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+                ui.column(.{ .grow = 1 }, .{
+                    ui.text(.{}, "Update my fork"),
+                    mutedParagraph(ui, note),
+                }),
+                ui.button(.{ .variant = .primary, .on_press = .update_fork, .disabled = !supported }, "Update my fork"),
+            }),
+        }),
     });
 }
 
@@ -843,4 +869,30 @@ test "DSH command errors do not ask for a global pnpm install" {
         "Plugin command failed - check npx and network",
         agentStatusCaption(info, false, false, true),
     );
+}
+
+test "settings keeps the upstream check and adds a separately labelled fork updater" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    var model: Model = .{};
+
+    const section = updatesSection(&ui, &model);
+    // heading, upstream hint, version row, auto-check row, warning, fork section
+    try std.testing.expectEqual(@as(usize, 6), section.nodes.len);
+    try std.testing.expectEqualStrings("Original Petdex updates", section.nodes[0].widget.text);
+
+    const fork = section.nodes[5];
+    try std.testing.expectEqualStrings("My fork updates", fork.nodes[0].widget.text);
+    const row = fork.nodes[1].nodes[0];
+    const button = row.nodes[1];
+    try std.testing.expectEqualStrings("Update my fork", button.widget.text);
+    model.fork_update_failed = true;
+    const failed = forkSection(&ui, &model);
+    const note = failed.nodes[1].nodes[0].nodes[0].nodes[1].widget.text;
+    if (builtin.os.tag == .macos) {
+        try std.testing.expect(std.mem.indexOf(u8, note, "~/src/petdex") != null);
+    } else {
+        try std.testing.expectEqualStrings("The fork updater runs on macOS only.", note);
+    }
 }

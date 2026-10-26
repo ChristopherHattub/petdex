@@ -87,6 +87,15 @@ sessions stay for ten minutes, then drop off. The tab moves to the left of
 the pet near the right screen edge and stays visible in Focus Mode. macOS and
 Windows only for now. Code: `src/agent_rail.zig`.
 
+## Updating this fork (macOS)
+
+Settings has two update sections. "Original Petdex updates" is the upstream
+check and is unchanged. "My fork updates" has an **Update my fork** button
+that opens `scripts/update-fork-macos.command` in Terminal, which pulls the
+fork, rebuilds, reinstalls `/Applications/Petdex.app` and relaunches it. It
+expects the checkout at `~/src/petdex`; run `scripts/install-fork-macos.sh`
+there once to set that up.
+
 ## Phone and watch notifications (ntfy, opt-in)
 
 Petdex can push the rail's "needs you" and "finished" edges to a

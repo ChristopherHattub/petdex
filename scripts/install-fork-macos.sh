@@ -16,16 +16,34 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Self-update: pull the fork first, and restart this script if it changed,
-# so one command is always enough.
+# Self-update: pull the fork's main first, and restart this script if it
+# changed, so one command is always enough. The clone may still be sitting on
+# a feature branch whose PR was merged (that branch never moves again), so
+# switch to main when the working tree is clean; building a stale branch and
+# reporting success is the failure this guards against.
 if [ -z "${PETDEX_UPDATED:-}" ]; then
   BEFORE="$(git -C "$REPO" rev-parse HEAD)"
-  git -C "$REPO" pull --ff-only --quiet || echo "warning: could not pull; building what is checked out" >&2
+  BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+  if [ "$BRANCH" != "main" ]; then
+    if git -C "$REPO" diff --quiet && git -C "$REPO" diff --cached --quiet; then
+      git -C "$REPO" fetch --quiet origin main && git -C "$REPO" checkout --quiet main \
+        && echo "Switched from $BRANCH to main." \
+        || echo "warning: could not switch to main; building $BRANCH" >&2
+    else
+      echo "warning: $BRANCH has uncommitted changes, so staying on it. Commit or stash them to update from main." >&2
+    fi
+  fi
+  if [ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)" = "main" ]; then
+    git -C "$REPO" pull --ff-only --quiet origin main || echo "warning: could not fast-forward main; building what is checked out" >&2
+  else
+    git -C "$REPO" pull --ff-only --quiet || echo "warning: could not pull; building what is checked out" >&2
+  fi
   if [ "$BEFORE" != "$(git -C "$REPO" rev-parse HEAD)" ]; then
     echo "Pulled new changes; restarting."
     PETDEX_UPDATED=1 exec "$REPO/scripts/install-fork-macos.sh" "$@"
   fi
 fi
+echo "Building $(git -C "$REPO" rev-parse --abbrev-ref HEAD) at $(git -C "$REPO" log -1 --format='%h %s')"
 PKG="$REPO/packages/petdex-desktop-native"
 SRC="${PETDEX_SRC:-$HOME/src}"
 SDK_REF=c0b10d027efa490fc99a3bc7f1cf88b015999d45

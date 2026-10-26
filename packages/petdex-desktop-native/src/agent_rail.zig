@@ -120,6 +120,12 @@ pub const Model = struct {
     flip_x: f64 = 0,
     window_w: f32 = 0,
     window_h: f32 = 0,
+    /// Agent-Pets: the three default rows show a mini pet instead of the
+    /// agent logo. Filled by main.zig from the settings each frame.
+    pets_on: bool = false,
+    pet_px: [pet_slots]f32 = @splat(default_pet_px),
+    /// Thumbnail-atlas index of the pet each default row shows.
+    pet_thumb: [pet_slots]?usize = @splat(null),
 
     pub fn slice(self: *const Model) []const Entry {
         return self.entries[0..self.len];
@@ -313,6 +319,13 @@ const icon_px: f32 = 26;
 const ring_px: f32 = 2.5;
 const ring_gap: f32 = 2;
 const cell_px: f32 = icon_px + (ring_px + ring_gap) * 2;
+/// Agent-Pets: one size per default row (Claude Code, Gemini, Codex).
+pub const pet_slots: usize = 3;
+pub const default_pet_px: f32 = 34;
+pub const min_pet_px: f32 = 20;
+pub const max_pet_px: f32 = 64;
+/// Corner logo on a pet, as a fraction of the pet's size.
+const badge_fraction: f32 = 0.42;
 const tab_padding: f32 = 7;
 const tab_gap: f32 = 6;
 const tab_radius: f32 = 12;
@@ -326,7 +339,6 @@ const ext_pad: f32 = 6;
 /// The extension is a little taller than the main ring so it reads as
 /// part of the tab rather than a chip beside it.
 const ext_overhang: f32 = 2;
-const ext_h: f32 = cell_px + ext_overhang * 2;
 const ext_radius: f32 = 10;
 /// Space between the pet's edge and the tab.
 pub const pet_gap: f64 = 4;
@@ -336,6 +348,37 @@ const flip_hysteresis: f64 = 48;
 
 pub fn baseWidth() f32 {
     return cell_px + tab_padding * 2;
+}
+
+/// Which Agent-Pets slot a hook name belongs to, if any.
+pub fn petSlot(name: []const u8) ?usize {
+    for (default_rows, 0..) |row, slot| {
+        if (sameAgent(row, name)) return slot;
+    }
+    return null;
+}
+
+fn cellOf(icon: f32, ring: f32, gap: f32) f32 {
+    return icon + (ring + gap) * 2;
+}
+
+/// Pet diameter for a row, or null while Agent-Pets is off or the row
+/// has no pet (other agents keep their logo).
+fn petPxFor(model: *const Model, name: []const u8) ?f32 {
+    if (!model.pets_on) return null;
+    const slot = petSlot(name) orelse return null;
+    if (model.pet_thumb[slot] == null) return null;
+    return std.math.clamp(model.pet_px[slot], min_pet_px, max_pet_px);
+}
+
+fn rowCell(model: *const Model, name: []const u8) f32 {
+    return cellOf(petPxFor(model, name) orelse icon_px, ring_px, ring_gap);
+}
+
+fn widestCell(model: *const Model, groups: *const Groups) f32 {
+    var widest = cell_px;
+    for (groups.slice()) |group| widest = @max(widest, rowCell(model, group.name));
+    return widest;
 }
 
 /// Width of the extension for a row with `sessions` live sessions; zero
@@ -354,13 +397,15 @@ fn maxExtWidth(groups: *const Groups) f32 {
 
 pub fn windowWidth(model: *const Model) f32 {
     const groups = groupsOf(model);
-    return baseWidth() + maxExtWidth(&groups);
+    return widestCell(model, &groups) + tab_padding * 2 + maxExtWidth(&groups);
 }
 
 pub fn windowHeight(model: *const Model) f32 {
     const groups = groupsOf(model);
     const n: f32 = @floatFromInt(@max(groups.len, 1));
-    return n * cell_px + (n - 1) * tab_gap + tab_padding * 2;
+    var total: f32 = 0;
+    for (groups.slice()) |group| total += rowCell(model, group.name);
+    return total + (n - 1) * tab_gap + tab_padding * 2;
 }
 
 pub fn active(model: *const Model) bool {
@@ -447,6 +492,15 @@ fn memberLabel(entry: *const Entry, slot: usize) []const u8 {
     return std.fmt.bufPrint(&member_labels[slot], "{s}: {s}", .{ name, entry.status.label() }) catch name;
 }
 
+/// The pet thumbnail atlas main.zig fills while pets are visible; one
+/// idle frame per catalog entry, side by side.
+pub const ThumbAtlas = struct {
+    image: u64,
+    ready: []const bool,
+    cell_w: f32,
+    cell_h: f32,
+};
+
 const RingSizes = struct { icon: f32, ring: f32, gap: f32 };
 
 const main_sizes: RingSizes = .{ .icon = icon_px, .ring = ring_px, .gap = ring_gap };
@@ -480,6 +534,51 @@ fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, 
     return ring;
 }
 
+/// Agent-Pets row: the pet's thumbnail inside the status ring, with the
+/// agent's logo on a dark chip in the top-right corner.
+pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, thumb: usize, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
+    const cell = cellOf(px, ring_px, ring_gap);
+    const pad = ring_px + ring_gap;
+    const ready = thumb < thumbs.ready.len and thumbs.ready[thumb];
+    var pet = ui.image(.{
+        .width = px,
+        .height = px,
+        .image = if (ready) thumbs.image else 0,
+    });
+    pet.widget.image_src = geometry.RectF.init(@as(f32, @floatFromInt(thumb)) * thumbs.cell_w, 0, thumbs.cell_w, thumbs.cell_h);
+    pet.widget.image_fit = .contain;
+    pet.widget.image_sampling = .linear;
+
+    const badge = px * badge_fraction;
+    const logo = badge - 3;
+    var glyph = ui.image(.{ .width = logo, .height = logo, .image = if (icons.ready) icons.image else 0 });
+    if (icons.ready) {
+        glyph.widget.image_src = icons.rect(icons.index(agent));
+        glyph.widget.image_fit = .contain;
+    }
+    var chip = ui.el(.panel, .{ .width = badge, .height = badge, .padding = 1.5 }, .{glyph});
+    chip.widget.style.radius = badge / 2;
+    chip.widget.style.background = canvas.Color.rgba8(0, 0, 0, 215);
+    chip.widget.style.border = canvas.Color.rgba8(255, 255, 255, 60);
+    chip.widget.style.stroke_width = 1;
+    // Children of a panel are placed at their own frame offset inside the
+    // padded content box; pull the chip over the ring's top-right corner.
+    chip.widget.frame.x = px - badge + pad;
+    chip.widget.frame.y = -pad;
+
+    var ring = ui.el(.panel, .{
+        .width = cell,
+        .height = cell,
+        .padding = pad,
+        .semantics = .{ .label = label },
+    }, .{ pet, chip });
+    ring.widget.style.radius = cell / 2;
+    ring.widget.style.background = canvas.Color.rgba8(255, 255, 255, 18);
+    ring.widget.style.border = ringColor(status);
+    ring.widget.style.stroke_width = ring_px;
+    return ring;
+}
+
 fn styleTab(node: *AppUi.Node, radius: f32) void {
     node.widget.style.radius = radius;
     node.widget.style.background = canvas.Color.rgba8(0, 0, 0, 150);
@@ -490,6 +589,7 @@ fn styleTab(node: *AppUi.Node, radius: f32) void {
 /// The extension for one row: a small ring per session, same translucent
 /// black as the tab it grows out of.
 fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: IconAtlas) AppUi.Node {
+    const ext_h = rowCell(model, group.name) + ext_overhang * 2;
     var minis: [max_entries]AppUi.Node = undefined;
     for (group.members[0..group.count], 0..) |member, i| {
         const entry = &model.entries[member];
@@ -506,13 +606,17 @@ fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: Ico
     return panel;
 }
 
-pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
+pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
     const groups = groupsOf(model);
     const ext_w = maxExtWidth(&groups);
     var cells: [max_groups]AppUi.Node = undefined;
     var slots: [max_groups]AppUi.Node = undefined;
     for (groups.slice(), 0..) |*group, slot| {
-        cells[slot] = ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons);
+        const ext_h = rowCell(model, group.name) + ext_overhang * 2;
+        cells[slot] = if (petPxFor(model, group.name)) |px|
+            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, model.pet_thumb[petSlot(group.name).?].?, icons, thumbs)
+        else
+            ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons);
         // Each slot is a little taller than the ring and the gaps shrink to
         // match, so the extension overhangs the row without moving it.
         const body = if (group.count > 1)
@@ -528,7 +632,7 @@ pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
     }
     var base = ui.el(.panel, .{
         .padding = tab_padding,
-        .width = baseWidth(),
+        .width = widestCell(model, &groups) + tab_padding * 2,
         .height = windowHeight(model),
         .semantics = .{ .label = "Agent status" },
     }, .{ui.column(.{ .gap = tab_gap, .cross = .center }, @as([]const AppUi.Node, cells[0..groups.len]))});
@@ -648,6 +752,9 @@ test "rail origin sits right of the pet and centers vertically" {
     try std.testing.expectEqual(@as(f64, 100 - @as(f64, windowWidth(&model)) - pet_gap), wantOrigin(&model, 100, 200, 192, 208).x);
 }
 
+const test_thumb_ready = [_]bool{ true, true, true };
+const test_thumbs: ThumbAtlas = .{ .image = 12, .ready = &test_thumb_ready, .cell_w = 48, .cell_h = 52 };
+
 fn testIconRect(index: usize) geometry.RectF {
     return geometry.RectF.init(@floatFromInt(index * 40), 0, 40, 40);
 }
@@ -693,7 +800,7 @@ test "the tab is always there: three idle rows with no sessions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var ui = AppUi.init(arena.allocator());
-    const root = railView(&ui, &model, test_icons);
+    const root = railView(&ui, &model, test_icons, test_thumbs);
     const column = root.nodes[0].nodes[0];
     try std.testing.expectEqual(@as(usize, 3), column.nodes.len);
     try std.testing.expectEqual(ringColor(.idle), column.nodes[0].widget.style.border);
@@ -764,7 +871,7 @@ test "rail view draws a ring per row and an extension for a busy agent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var ui = AppUi.init(arena.allocator());
-    const root = railView(&ui, &model, test_icons);
+    const root = railView(&ui, &model, test_icons, test_thumbs);
     const column = root.nodes[0].nodes[0];
     try std.testing.expectEqual(@as(usize, 3), column.nodes.len);
     // Claude: running beats done. Gemini row second, Codex third.
@@ -791,8 +898,32 @@ test "rail view mirrors when the pet is at the right edge" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var ui = AppUi.init(arena.allocator());
-    const root = railView(&ui, &model, test_icons);
+    const root = railView(&ui, &model, test_icons, test_thumbs);
     // Extension column first, base tab last (next to the pet).
     try std.testing.expectEqual(@as(usize, 2), root.nodes.len);
     try std.testing.expectEqualStrings("Agent status", root.nodes[1].widget.semantics.label);
+}
+
+test "Agent-Pets sizes rows by the pet and leaves other agents on the logo" {
+    var model = testModel(&.{});
+    const logo_height = windowHeight(&model);
+    model.pets_on = true;
+    model.pet_px = .{ 50, 40, 30 };
+    model.pet_thumb = .{ 0, 1, null };
+    // Codex has no pet to draw, so it keeps the logo cell.
+    try std.testing.expectEqual(@as(?f32, 50), petPxFor(&model, "claude-code"));
+    try std.testing.expectEqual(@as(?f32, 40), petPxFor(&model, "antigravity"));
+    try std.testing.expectEqual(@as(?f32, null), petPxFor(&model, "codex"));
+    try std.testing.expect(windowHeight(&model) > logo_height);
+    try std.testing.expectEqual(widestCell(&model, &groupsOf(&model)) + tab_padding * 2, windowWidth(&model));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    const root = railView(&ui, &model, test_icons, test_thumbs);
+    const column = root.nodes[0].nodes[0];
+    try std.testing.expectEqual(@as(usize, 3), column.nodes.len);
+    // A pet row carries the thumbnail and the corner logo chip.
+    try std.testing.expectEqual(@as(usize, 2), column.nodes[0].nodes.len);
+    try std.testing.expectEqual(ringColor(.idle), column.nodes[0].widget.style.border);
 }

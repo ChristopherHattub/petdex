@@ -32,6 +32,8 @@ const herdr_status = @import("herdr_status.zig");
 const sdk_log = @import("sdk_log.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
+const agent_rail = @import("agent_rail.zig");
+const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -116,6 +118,12 @@ pub const Msg = union(enum) {
     toggle_launch_at_login,
     toggle_focus_mode,
     toggle_rotate_pets,
+    toggle_agent_pets,
+    set_agent_pet_size_claude: f32,
+    set_agent_pet_size_gemini: f32,
+    set_agent_pet_size_codex: f32,
+    cycle_agent_pet: u8,
+    toggle_section: u8,
     shuffle_pet,
     quit_app,
     install_agent: u32,
@@ -125,6 +133,10 @@ pub const Msg = union(enum) {
     pet_filter: canvas.TextInputEvent,
     refresh_pets,
     toggle_pets_expanded,
+    toggle_pet_picker,
+    ask_delete_pet: u32,
+    cancel_delete_pet,
+    confirm_delete_pet,
     toggle_flock_window,
     focus_flock_member: u32,
     manifest_done: native_sdk.EffectExit,
@@ -147,6 +159,8 @@ pub const Msg = union(enum) {
     download_update,
     copy_brew_command,
     brew_command_copied: native_sdk.EffectClipboardResult,
+    update_fork,
+    fork_update_done: native_sdk.EffectExit,
     auth_sign_in,
     auth_refresh,
     auth_sign_out,
@@ -162,8 +176,26 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "fork_update_done", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
 };
+
+/// The collapsible groups of the settings window.
+pub const Section = enum(u8) { pet, agent_pets, agents, appearance, messages, general, updates };
+const default_sections_open: u16 = 0b111;
+
+pub fn sectionOpen(model: *const Model, section: Section) bool {
+    return model.sections_open & (@as(u16, 1) << @as(u4, @intCast(@intFromEnum(section)))) != 0;
+}
+
+/// Catalog index of the pet an Agent-Pets row shows; the active pet
+/// until a row picks its own, or when that pet is no longer installed.
+pub fn agentPetCatalogIndex(model: *const Model, slot: usize) ?usize {
+    if (slot < agent_rail.pet_slots and model.agent_pet_name_len[slot] > 0) {
+        if (catalog_mod.catalogIndexOf(model.agent_pet_name[slot][0..model.agent_pet_name_len[slot]])) |i| return i;
+    }
+    if (model.active_pet < catalog_mod.catalog_len) return model.active_pet;
+    return null;
+}
 
 pub const Model = struct {
     sheet_loaded: bool = false,
@@ -342,15 +374,35 @@ pub const Model = struct {
     update_cancel_pending: bool = false,
     update_restart_after_cancel: bool = false,
     brew_command_copied: bool = false,
+    /// "Update my fork" could not start the updater in Terminal.
+    fork_update_failed: bool = false,
     agents_prompted: bool = false,
     codex_trust_note: bool = false,
     pet_filter: [48]u8 = @splat(0),
     pet_filter_len: usize = 0,
     pets_expanded: bool = false,
+    /// Settings shows one big portrait of the active pet; this swaps it
+    /// for the picker. `pet_delete_pending` is the catalog index awaiting
+    /// delete confirmation, or max_catalog for none.
+    pet_picker_open: bool = false,
+    pet_delete_pending: u32 = max_catalog,
     /// One body per live agent. Derived from the same bubbles the
     /// mailbox already keys by session, so the set exists whether or
     /// not the window is open.
     flock: flock_mod.Model = .{},
+    /// Status tab beside the pet, one ringed logo per live agent.
+    rail: agent_rail.Model = .{},
+    /// Agent-Pets: mini pets on the rail's Claude Code / Gemini / Codex
+    /// rows instead of the agent logos. A zero-length name follows the
+    /// active pet.
+    agent_pets: bool = false,
+    agent_pet_px: [agent_rail.pet_slots]f32 = @splat(agent_rail.default_pet_px),
+    agent_pet_name: [agent_rail.pet_slots][64]u8 = @splat(@splat(0)),
+    agent_pet_name_len: [agent_rail.pet_slots]u8 = @splat(0),
+    /// Settings sections that are expanded, one bit per `Section`.
+    sections_open: u16 = default_sections_open,
+    /// Opt-in phone/watch push on the rail's edges; off without config.
+    ntfy: ntfy.Notifier = .{},
     install: InstallState = .{},
     remotes: [remote_runtime.max_remotes]remote_runtime.Slot = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
     remote_count: usize = 0,
@@ -909,6 +961,9 @@ const update_boot_timer_key: u64 = 33;
 const homebrew_timeout_timer_key: u64 = 34;
 const dsh_install_key: u64 = 35;
 const dsh_remove_key: u64 = 36;
+const fork_update_key: u64 = 37;
+/// Where install-fork-macos.sh clones the fork; relative to $HOME.
+pub const fork_update_script = "src/petdex/scripts/update-fork-macos.command";
 const auth_token_key: u64 = 43;
 const auth_library_key: u64 = 44;
 const auth_avatar_key: u64 = 45;
@@ -1241,6 +1296,22 @@ fn scanCatalog(io: std.Io, allocator: std.mem.Allocator) void {
     }
 }
 
+/// Remove an installed pet's folder. Only the Petdex root is touched: the
+/// Codex root belongs to Codex, and a pet listed from there is read-only
+/// here. The active pet is never deletable (callers check), so its
+/// decoded sheet stays valid.
+fn deletePet(model: *Model, index: usize) void {
+    const home = env_home orelse return;
+    const entry = &catalog[index];
+    const slug = entry.slice();
+    if (!petNameOk(slug) or slug[0] == '.') return;
+    if (!std.mem.eql(u8, entry.rootSlice(), installer.install_roots[0])) return;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ home, installer.install_roots[0], slug }) catch return;
+    if (!plat.deleteTree(path)) return;
+    refreshCatalog(model);
+}
+
 fn refreshCatalog(model: *Model) void {
     if (env_home == null or model.install.busy()) return;
     var scope = plat.Scope.init();
@@ -1345,6 +1416,12 @@ fn jsonUnescapeString(value: []const u8, output: []u8) ?[]const u8 {
     return output[0..len];
 }
 
+fn setAgentPetSize(model: *Model, slot: usize, fraction: f32) void {
+    const f = std.math.clamp(fraction, 0, 1);
+    model.agent_pet_px[slot] = agent_rail.min_pet_px + f * (agent_rail.max_pet_px - agent_rail.min_pet_px);
+    saveSettings(model);
+}
+
 fn saveSettings(model: *const Model) void {
     var path_buf: [512]u8 = undefined;
     const path = settingsPath(&path_buf) orelse return;
@@ -1352,7 +1429,7 @@ fn saveSettings(model: *const Model) void {
     // drops the whole save): keep room for the configurable bubble
     // fields, rotation state, a long slug, and negative coordinates.
     // Grown with every key added; `font_path` alone can escape to 1024.
-    var buf: [2304]u8 = undefined;
+    var buf: [2816]u8 = undefined;
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
     // The position keys only exist once the window has been fitted and
     // read: a save fired on the very first frame would otherwise
@@ -1367,7 +1444,14 @@ fn saveSettings(model: *const Model) void {
     const font_path = std.mem.trim(u8, model.font_path[0..model.font_path_len], " \t\r\n");
     const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return;
     const latest = model.latest_version[0..model.latest_version_len];
-    const json = std.fmt.bufPrint(&buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"bubble_columns\":{},\"bubble_answer_lines\":{},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{}}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, model.bubble_columns, model.bubble_answer_lines, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted }) catch return;
+    var pets_buf: [512]u8 = undefined;
+    var esc: [agent_rail.pet_slots][128]u8 = undefined;
+    var esc_names: [agent_rail.pet_slots][]const u8 = undefined;
+    for (0..agent_rail.pet_slots) |slot| {
+        esc_names[slot] = jsonEscapeString(model.agent_pet_name[slot][0..model.agent_pet_name_len[slot]], &esc[slot]) orelse "";
+    }
+    const agent_pets = std.fmt.bufPrint(&pets_buf, ",\"agent_pets\":{},\"agent_pet_px\":[{d:.0},{d:.0},{d:.0}],\"agent_pet_0\":\"{s}\",\"agent_pet_1\":\"{s}\",\"agent_pet_2\":\"{s}\"", .{ model.agent_pets, model.agent_pet_px[0], model.agent_pet_px[1], model.agent_pet_px[2], esc_names[0], esc_names[1], esc_names[2] }) catch "";
+    const json = std.fmt.bufPrint(&buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"bubble_columns\":{},\"bubble_answer_lines\":{},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{}{s}}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, model.bubble_columns, model.bubble_answer_lines, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, agent_pets }) catch return;
     cWriteFile(path, json);
 }
 
@@ -1514,6 +1598,10 @@ var initial_bubble_lifetime_secs: f32 = bubble_lifetime_default_secs;
 var initial_bubble_columns: u16 = bubble_columns_default;
 var initial_bubble_answer_lines: u8 = bubble_answer_lines_default;
 var initial_hide_dock: bool = false;
+var initial_agent_pets: bool = false;
+var initial_agent_pet_px: [agent_rail.pet_slots]f32 = @splat(agent_rail.default_pet_px);
+var initial_agent_pet_name: [agent_rail.pet_slots][64]u8 = @splat(@splat(0));
+var initial_agent_pet_name_len: [agent_rail.pet_slots]u8 = @splat(0);
 var initial_rotate_pets: bool = false;
 var initial_rotation_day: u32 = 0;
 var initial_agents_prompted: bool = false;
@@ -1557,7 +1645,7 @@ var agents_icons_dark: bool = false;
 var agent_icon_pixels: []u8 = &.{};
 
 /// Where agent `index`'s logo sits in the packed strip.
-fn agentIconRect(index: usize) geometry.RectF {
+pub fn agentIconRect(index: usize) geometry.RectF {
     return geometry.RectF.init(
         @as(f32, @floatFromInt(index * agent_icon_px)),
         0,
@@ -1575,7 +1663,7 @@ const AgentArt = struct { light: []const u8, dark: []const u8 };
 const agent_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/claude-code.png"), .dark = @embedFile("assets/agents/claude-code.png") },
     .{ .light = @embedFile("assets/agents/codex.png"), .dark = @embedFile("assets/agents/codex.png") },
-    .{ .light = @embedFile("assets/agents/gemini.png"), .dark = @embedFile("assets/agents/gemini.png") },
+    .{ .light = @embedFile("assets/agents/antigravity.png"), .dark = @embedFile("assets/agents/antigravity.png") },
     .{ .light = @embedFile("assets/agents/opencode-light.png"), .dark = @embedFile("assets/agents/opencode-dark.png") },
     .{ .light = @embedFile("assets/agents/qoder.png"), .dark = @embedFile("assets/agents/qoder.png") },
     .{ .light = @embedFile("assets/agents/kimi-code.png"), .dark = @embedFile("assets/agents/kimi-code.png") },
@@ -1717,13 +1805,13 @@ fn agentArtBytes(agent: []const u8, dark: bool) []const u8 {
 }
 
 /// Which cell of the packed logo strip belongs to this agent.
-fn agentIconIndex(agent: []const u8) usize {
+pub fn agentIconIndex(agent: []const u8) usize {
     if (std.mem.eql(u8, agent, "herdr")) return herdr_icon_index;
     if (agentKindForName(agent)) |kind| return @intFromEnum(kind);
     return agent_fallback_index;
 }
 
-fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
+pub fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     for (std.enums.values(agent_hooks.AgentKind)) |kind| {
         if (std.mem.eql(u8, kind.hookAgentName(), agent)) return kind;
     }
@@ -1731,6 +1819,8 @@ fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     if (std.mem.eql(u8, agent, "open-code")) return .opencode;
     if (std.mem.eql(u8, agent, "qodercli")) return .qoder;
     if (std.mem.eql(u8, agent, "kimi")) return .kimi_code;
+    // Gemini CLI is now Antigravity; treat either spelling as one agent.
+    if (std.mem.eql(u8, agent, "antigravity")) return .gemini;
     return null;
 }
 
@@ -1854,6 +1944,27 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
             // Dock icon, a missing key keeps the stock behavior.
             if (std.mem.indexOf(u8, json, "\"hide_dock\":true") != null) {
                 initial_hide_dock = true;
+            }
+            if (std.mem.indexOf(u8, json, "\"agent_pets\":true") != null) {
+                initial_agent_pets = true;
+            }
+            if (std.mem.indexOf(u8, json, "\"agent_pet_px\":[")) |at| {
+                var rest = json[at + "\"agent_pet_px\":[".len ..];
+                for (0..agent_rail.pet_slots) |slot| {
+                    const end = std.mem.indexOfAny(u8, rest, ",]") orelse break;
+                    const value = std.fmt.parseFloat(f32, std.mem.trim(u8, rest[0..end], " ")) catch break;
+                    if (value >= agent_rail.min_pet_px and value <= agent_rail.max_pet_px) initial_agent_pet_px[slot] = value;
+                    if (end + 1 >= rest.len) break;
+                    rest = rest[end + 1 ..];
+                }
+            }
+            inline for (0..agent_rail.pet_slots) |slot| {
+                const key = std.fmt.comptimePrint("agent_pet_{d}", .{slot});
+                if (hook_server.jsonStringPub(json, key)) |encoded| {
+                    if (jsonUnescapeString(encoded, &initial_agent_pet_name[slot])) |value| {
+                        initial_agent_pet_name_len[slot] = @intCast(value.len);
+                    }
+                }
             }
             if (hook_server.jsonNumberPub(json, "pet_x")) |x| {
                 if (hook_server.jsonNumberPub(json, "pet_y")) |y| {
@@ -2177,6 +2288,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
         // registry. A secondary desktop forwarding to the first process must
         // not supervise tunnels with credentials that listener cannot know.
         if (owns_hook_listener) startRemotes(model, fx);
+        // Only the process that owns the listener sees every event, so it
+        // alone notifies; a forwarding second instance would double up.
+        if (owns_hook_listener) model.ntfy.config = ntfy.load(home);
     }
     loadAuthSession(model, fx);
     fx.startTimer(.{
@@ -2205,6 +2319,10 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.font_load_failed = initial_font_load_failed;
     model.agents_prompted = initial_agents_prompted;
     model.hide_dock = initial_hide_dock;
+    model.agent_pets = initial_agent_pets;
+    model.agent_pet_px = initial_agent_pet_px;
+    model.agent_pet_name = initial_agent_pet_name;
+    model.agent_pet_name_len = initial_agent_pet_name_len;
     model.rotate_pets = initial_rotate_pets;
     model.rotation_day = initial_rotation_day;
     model.update_checks_enabled = initial_update_checks;
@@ -2331,6 +2449,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             applyState(model, model.state.next(), 0, fx);
         },
         .toggle_pets_expanded => model.pets_expanded = !model.pets_expanded,
+        .toggle_pet_picker => {
+            model.pet_picker_open = !model.pet_picker_open;
+            model.pet_delete_pending = max_catalog;
+        },
+        .ask_delete_pet => |index| {
+            if (index >= catalog_mod.catalog_len or index == model.active_pet) return;
+            model.pet_delete_pending = index;
+        },
+        .cancel_delete_pet => model.pet_delete_pending = max_catalog,
+        .confirm_delete_pet => {
+            const index = model.pet_delete_pending;
+            model.pet_delete_pending = max_catalog;
+            if (index >= catalog_mod.catalog_len or index == model.active_pet) return;
+            deletePet(model, index);
+        },
         .refresh_pets => refreshCatalog(model),
         .focus_flock_member => |index| {
             // The pane id rode all the way from Herdr on the bubble this
@@ -2745,6 +2878,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .download_update => plat.openExternal(updates.downloadUrl()),
+        .update_fork => {
+            // Hands off to Terminal: the updater quits and replaces this
+            // app, so it cannot be our child. `open` returns at once.
+            model.fork_update_failed = true;
+            if (builtin.os.tag != .macos) return;
+            const home = env_home orelse return;
+            var path_buf: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, fork_update_script }) catch return;
+            if (!plat.fileExists(path)) return;
+            model.fork_update_failed = false;
+            fx.spawn(.{
+                .key = fork_update_key,
+                .argv = &.{ "/usr/bin/open", path },
+                .output = .collect,
+                .on_exit = Effects.exitMsg(.fork_update_done),
+            });
+        },
+        .fork_update_done => |exit| {
+            model.fork_update_failed = !(exit.reason == .exited and exit.code == 0);
+        },
         .copy_brew_command => {
             model.brew_command_copied = false;
             fx.writeClipboard(.{
@@ -2764,6 +2917,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (index == model.active_pet and model.sheet_loaded) return;
             if (!loadSheetForPet(fx, &catalog[index])) return;
             model.active_pet = index;
+            model.pet_picker_open = false;
+            model.pet_delete_pending = max_catalog;
             model.frame_index = 0;
             // First pet on a fresh install: the window was drawing the
             // empty state, and nothing else flips this back.
@@ -2910,6 +3065,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .shuffle_pet => advancePet(model, fx),
         .quit_app => plat.requestQuit(),
+        .toggle_agent_pets => {
+            model.agent_pets = !model.agent_pets;
+            saveSettings(model);
+        },
+        .set_agent_pet_size_claude => |fraction| setAgentPetSize(model, 0, fraction),
+        .set_agent_pet_size_gemini => |fraction| setAgentPetSize(model, 1, fraction),
+        .set_agent_pet_size_codex => |fraction| setAgentPetSize(model, 2, fraction),
+        .cycle_agent_pet => |slot| {
+            if (slot >= agent_rail.pet_slots or catalog_mod.catalog_len == 0) return;
+            const current = agentPetCatalogIndex(model, slot) orelse catalog_mod.catalog_len - 1;
+            const next = (current + 1) % catalog_mod.catalog_len;
+            const name = catalog[next].slice();
+            @memcpy(model.agent_pet_name[slot][0..name.len], name);
+            model.agent_pet_name_len[slot] = @intCast(name.len);
+            saveSettings(model);
+        },
+        .toggle_section => |index| {
+            if (index >= @typeInfo(Section).@"enum".fields.len) return;
+            model.sections_open ^= @as(u16, 1) << @as(u4, @intCast(index));
+        },
         .set_scale => |fraction| {
             model.scale = 0.4 + fraction * 0.8;
             _ = fitWindow(model, fx);
@@ -3031,6 +3206,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // the whole arc.
                 updateBubbleStackInFlight(model, now);
                 syncBubbleWindow(model, fx);
+                syncRailWindow(model, fx);
                 if (model.vx >= physics_min_vel) {
                     setThrowState(model, .@"running-right", fx);
                 } else if (model.vx <= -physics_min_vel) {
@@ -3065,6 +3241,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // needs no cursor.
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
+            syncRailWindow(model, fx);
             if (model.dragging) {
                 if (read.primary_down) {
                     // Follow the cursor keeping the grab offset, and
@@ -3193,11 +3370,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             drainPendingInstall(model, fx);
             sdk_log.tick(fx.wallMs());
             if (!model.sheet_loaded) return;
-            if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
+            // The rail draws before any agent speaks, so its logos cannot
+            // wait for the first drained bubble.
+            if (railShown(model)) loadAgentsAtlas(model.dark, fx);
+            if ((model.settings_open or model.agent_pets) and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
+                // Ahead of the bubble branch: the rail shows agents even
+                // with bubbles off, and keeps finished ones after their
+                // card expires.
+                var rail_edges: [agent_rail.max_entries]agent_rail.Transition = undefined;
+                const edge_count = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
+                ntfy.onTransitions(&model.ntfy, fx, &model.rail, rail_edges[0..edge_count], drained[0..raw_count], now);
                 if (model.settings_open) {
                     for (drained[0..raw_count]) |bubble| {
                         if (std.mem.eql(u8, bubble.agent[0..bubble.agent_len], "dsh")) {
@@ -3246,6 +3432,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
             _ = expireBubbles(model, now);
+            _ = agent_rail.expire(&model.rail, now);
             // A newly drained bubble is declared as a popup in the same
             // update pass. Compute Linux's side after expiry and before
             // that declaration so the first rendered frame uses the same
@@ -4851,6 +5038,23 @@ fn flockBadge(ui: *AppUi, member: *const flock_mod.Member) AppUi.Node {
     return ui.row(.{ .cross = .center, .gap = 3 }, .{ identity, marker });
 }
 
+// ------------------------------------------------------------ agent rail
+
+/// Always on, focus mode included: it is a status display, not chatter.
+fn railShown(model: *const Model) bool {
+    return agent_rail.active(&model.rail) and model.sheet_loaded;
+}
+
+fn syncRailWindow(model: *Model, fx: *Effects) void {
+    if (!railShown(model)) return;
+    model.rail.pets_on = model.agent_pets;
+    for (0..agent_rail.pet_slots) |slot| {
+        model.rail.pet_px[slot] = model.agent_pet_px[slot];
+        model.rail.pet_thumb[slot] = agentPetCatalogIndex(model, slot);
+    }
+    agent_rail.sync(&model.rail, fx, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
+}
+
 const settings_window_label = "settings";
 const settings_canvas_label = "settings-canvas";
 
@@ -4906,6 +5110,25 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         }
         count += 1;
     }
+    if (railShown(model)) {
+        const origin = agent_rail.wantOrigin(&model.rail, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
+        scratch.windows[count] = .{
+            .label = agent_rail.window_label,
+            .canvas_label = agent_rail.canvas_label,
+            .title = "",
+            .width = agent_rail.windowWidth(&model.rail),
+            .height = agent_rail.windowHeight(&model.rail),
+            .x = @floatCast(origin.x),
+            .y = @floatCast(origin.y),
+            .resizable = false,
+            .titlebar = .chromeless,
+            .floating = true,
+            .fullscreen_overlay = true,
+            .transparent = true,
+            .click_through = true,
+        };
+        count += 1;
+    }
     if (model.flock.open) {
         const size = flock_mod.windowSize(model.flock.len, flockLayout(model));
         scratch.windows[count] = .{
@@ -4956,6 +5179,17 @@ test "companion windows use the unified opaque shell" {
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     if (std.mem.eql(u8, window_label, flock_window_label)) return flockView(ui, model);
+    if (std.mem.eql(u8, window_label, agent_rail.window_label)) return agent_rail.railView(ui, &model.rail, .{
+        .ready = agents_icons_ready,
+        .image = agent_icon_atlas_id,
+        .rect = &agentIconRect,
+        .index = &agentIconIndex,
+    }, .{
+        .image = thumb_atlas_id,
+        .ready = &thumbs_ready,
+        .cell_w = @floatFromInt(thumb_w),
+        .cell_h = @floatFromInt(thumb_h),
+    });
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
     return settings_view.settingsView(ui, model, .{
         .ready = agents_icons_ready,
@@ -5659,6 +5893,8 @@ test {
     _ = remote_writeback;
     _ = sdk_log;
     _ = settings_view;
+    _ = agent_rail;
+    _ = ntfy;
 }
 
 test "bubble geometry follows columns lines and font size" {

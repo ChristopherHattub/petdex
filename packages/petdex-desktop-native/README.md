@@ -75,6 +75,48 @@ Petdex never rewrites this file when other desktop settings change. If the file
 is unreadable, invalid JSON, or contains an invalid path, Claude hook changes
 are disabled for that run. Correct the file and restart Petdex to try again.
 
+## Agent rail
+
+A translucent tab to the right of the pet with one row per agent type
+(Claude Code, Gemini CLI / Antigravity, Codex, then any others). The row's
+ring is the most urgent state among that agent's sessions: red while
+working, yellow while it waits on a permission prompt or question, green once
+the turn ends. With two or more sessions of the same agent the tab extends to
+the right at that row, with a small ringed icon per session. Finished
+sessions stay for ten minutes, then drop off. The tab moves to the left of
+the pet near the right screen edge and stays visible in Focus Mode. macOS and
+Windows only for now. Code: `src/agent_rail.zig`.
+
+**Agent-Pets.** Settings > Appearance > Agent-Pets swaps the Claude Code, Antigravity and Codex logos for mini pets inside the same status ring, with the agent logo small in the top-right corner. A new "Agent-Pets" section appears under Pet with one portrait per agent: click it to switch that agent's pet, and use its slider to resize it. Settings are grouped into collapsible sections.
+
+## Updating this fork (macOS)
+
+Settings has two update sections. "Original Petdex updates" is the upstream
+check and is unchanged. "My fork updates" has an **Update my fork** button
+that opens `scripts/update-fork-macos.command` in Terminal, which pulls the
+fork, rebuilds, reinstalls `/Applications/Petdex.app` and relaunches it. It
+expects the checkout at `~/src/petdex`; run `scripts/install-fork-macos.sh`
+there once to set that up.
+
+## Phone and watch notifications (ntfy, opt-in)
+
+Petdex can push the rail's "needs you" and "finished" edges to a
+self-hosted [ntfy](https://ntfy.sh) server. It is off unless
+`~/.petdex-ntfy/env` exists, is `chmod 600`, and contains:
+
+```sh
+NTFY_URL=https://your-mac.your-tailnet.ts.net   # https, or http to loopback only
+NTFY_TOPIC=your_random_topic
+NTFY_TOKEN=tk_write_only_token
+NTFY_FROM_APP=1
+```
+
+The file is parsed as plain `KEY=VALUE` text, never executed, and read once
+at launch. Use a write-only token scoped to that topic. Secrets never live in
+the repo or in Petdex's settings file. If you also run a separate ntfy agent
+hook, remove it, or you get two notifications for each event. Code:
+`src/ntfy.zig`.
+
 ## Herdr
 
 The local Herdr plugin mirrors agent attention from Herdr into Petdex and

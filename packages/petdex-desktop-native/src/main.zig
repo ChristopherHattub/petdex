@@ -127,6 +127,10 @@ pub const Msg = union(enum) {
     pet_filter: canvas.TextInputEvent,
     refresh_pets,
     toggle_pets_expanded,
+    toggle_pet_picker,
+    ask_delete_pet: u32,
+    cancel_delete_pet,
+    confirm_delete_pet,
     toggle_flock_window,
     focus_flock_member: u32,
     manifest_done: native_sdk.EffectExit,
@@ -349,6 +353,11 @@ pub const Model = struct {
     pet_filter: [48]u8 = @splat(0),
     pet_filter_len: usize = 0,
     pets_expanded: bool = false,
+    /// Settings shows one big portrait of the active pet; this swaps it
+    /// for the picker. `pet_delete_pending` is the catalog index awaiting
+    /// delete confirmation, or max_catalog for none.
+    pet_picker_open: bool = false,
+    pet_delete_pending: u32 = max_catalog,
     /// One body per live agent. Derived from the same bubbles the
     /// mailbox already keys by session, so the set exists whether or
     /// not the window is open.
@@ -1245,6 +1254,22 @@ fn scanCatalog(io: std.Io, allocator: std.mem.Allocator) void {
             catalog_mod.catalog_len += 1;
         }
     }
+}
+
+/// Remove an installed pet's folder. Only the Petdex root is touched: the
+/// Codex root belongs to Codex, and a pet listed from there is read-only
+/// here. The active pet is never deletable (callers check), so its
+/// decoded sheet stays valid.
+fn deletePet(model: *Model, index: usize) void {
+    const home = env_home orelse return;
+    const entry = &catalog[index];
+    const slug = entry.slice();
+    if (!petNameOk(slug) or slug[0] == '.') return;
+    if (!std.mem.eql(u8, entry.rootSlice(), installer.install_roots[0])) return;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ home, installer.install_roots[0], slug }) catch return;
+    if (!plat.deleteTree(path)) return;
+    refreshCatalog(model);
 }
 
 fn refreshCatalog(model: *Model) void {
@@ -2342,6 +2367,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             applyState(model, model.state.next(), 0, fx);
         },
         .toggle_pets_expanded => model.pets_expanded = !model.pets_expanded,
+        .toggle_pet_picker => {
+            model.pet_picker_open = !model.pet_picker_open;
+            model.pet_delete_pending = max_catalog;
+        },
+        .ask_delete_pet => |index| {
+            if (index >= catalog_mod.catalog_len or index == model.active_pet) return;
+            model.pet_delete_pending = index;
+        },
+        .cancel_delete_pet => model.pet_delete_pending = max_catalog,
+        .confirm_delete_pet => {
+            const index = model.pet_delete_pending;
+            model.pet_delete_pending = max_catalog;
+            if (index >= catalog_mod.catalog_len or index == model.active_pet) return;
+            deletePet(model, index);
+        },
         .refresh_pets => refreshCatalog(model),
         .focus_flock_member => |index| {
             // The pane id rode all the way from Herdr on the bubble this
@@ -2775,6 +2815,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (index == model.active_pet and model.sheet_loaded) return;
             if (!loadSheetForPet(fx, &catalog[index])) return;
             model.active_pet = index;
+            model.pet_picker_open = false;
+            model.pet_delete_pending = max_catalog;
             model.frame_index = 0;
             // First pet on a fresh install: the window was drawing the
             // empty state, and nothing else flips this back.

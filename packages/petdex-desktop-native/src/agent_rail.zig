@@ -684,6 +684,44 @@ fn focusMsg(model: *const Model, index: ?usize) ?Msg {
     return Msg{ .focus_rail_session = @intCast(i) };
 }
 
+var strip_labels: [32][96]u8 = undefined;
+
+/// A live status line for one agent, for the Agents list in Settings: the
+/// tab's ring, what the agent is doing, and one ring per thread (each
+/// opens its session), all from the same state the tab reads.
+pub fn statusStrip(ui: *AppUi, model: *const Model, agent: []const u8, slot: usize, icons: IconAtlas) AppUi.Node {
+    const groups = groupsOf(model);
+    var status: Status = .idle;
+    var count: usize = 0;
+    var members: [max_entries]u8 = @splat(0);
+    for (groups.slice()) |group| {
+        if (!sameAgent(group.name, agent)) continue;
+        status = group.status;
+        count = group.count;
+        members = group.members;
+        break;
+    }
+    const label_slot = slot % strip_labels.len;
+    const label = if (count == 0)
+        std.fmt.bufPrint(&strip_labels[label_slot], "No active sessions", .{}) catch "No active sessions"
+    else if (count == 1)
+        std.fmt.bufPrint(&strip_labels[label_slot], "{s} \u{b7} 1 thread", .{status.label()}) catch status.label()
+    else
+        std.fmt.bufPrint(&strip_labels[label_slot], "{s} \u{b7} {d} threads", .{ status.label(), count }) catch status.label();
+
+    var minis: [max_entries]AppUi.Node = undefined;
+    for (members[0..count], 0..) |member, i| {
+        const entry = &model.entries[member];
+        minis[i] = ringedIcon(ui, entry.agentSlice(), entry.status, memberLabel(entry, member), mini_sizes, icons, focusMsg(model, member));
+    }
+    const top = if (count == 0) null else focusTarget(model, &.{ .name = agent, .count = count, .status = status, .members = members });
+    return ui.row(.{ .gap = 10, .cross = .center }, .{
+        ringedIcon(ui, agent, status, label, main_sizes, icons, focusMsg(model, top)),
+        ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .sm }, label)}),
+        ui.row(.{ .gap = mini_gap, .cross = .center }, @as([]const AppUi.Node, minis[0..count])),
+    });
+}
+
 fn styleTab(node: *AppUi.Node, radius: f32) void {
     node.widget.style.radius = radius;
     node.widget.style.background = canvas.Color.rgba8(0, 0, 0, 150);
@@ -1050,4 +1088,21 @@ test "tab icons jump to their session and quiet running sessions stay working" {
     entry.remote = true;
     try std.testing.expect(focusMsg(&model, 0) == null);
     try std.testing.expect(focusMsg(&model, null) == null);
+}
+
+test "settings status strip shows an agent's live threads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    const model = testModel(&.{
+        testBubble("a", "antigravity", .running),
+        testBubble("b", "gemini", .needs_input),
+    });
+    const strip = statusStrip(&ui, &model, "gemini", 0, test_icons);
+    // ring, label, then one ring per thread
+    try std.testing.expectEqual(@as(usize, 3), strip.nodes.len);
+    try std.testing.expectEqual(@as(usize, 2), strip.nodes[2].nodes.len);
+    try std.testing.expectEqualStrings("waiting for you \u{b7} 2 threads", strip.nodes[1].nodes[0].widget.text);
+    const idle = statusStrip(&ui, &model, "codex", 1, test_icons);
+    try std.testing.expectEqual(@as(usize, 0), idle.nodes[2].nodes.len);
 }

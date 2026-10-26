@@ -91,6 +91,8 @@ Windows only for now. Code: `src/agent_rail.zig`.
 
 Clicking an icon in the tab jumps to that session: its Herdr pane, then the terminal or editor it reported, then the agent's own app (Claude, Antigravity, Codex). A session that has gone quiet for under five minutes still reads as working.
 
+Settings > Agents shows each connected agent's live status and threads under its row. Antigravity (CLI and IDE) reads its hooks from `~/.gemini/config/hooks.json` rather than Gemini CLI's `settings.json`, so the Gemini row installs both; press Update on it once to add the Antigravity half.
+
 ## Updating this fork (macOS)
 
 Settings has two update sections. "Original Petdex updates" is the upstream

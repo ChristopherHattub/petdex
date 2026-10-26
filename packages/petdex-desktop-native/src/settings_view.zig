@@ -201,13 +201,24 @@ fn agentsSection(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
             .style_tokens = .{ .background = .surface, .radius = .md },
             .semantics = .{ .label = info.kind.displayName() },
         }, .{
-            ui.row(.{ .gap = 12, .cross = .center }, .{
-                logo,
-                ui.column(.{ .grow = 1, .main = .center }, .{
-                    ui.text(.{}, info.kind.displayName()),
-                    mutedParagraph(ui, agentStatusCaption(info, model.codex_trust_note, model.dsh_busy, model.dsh_error)),
+            ui.column(.{ .gap = 10 }, .{
+                ui.row(.{ .gap = 12, .cross = .center }, .{
+                    logo,
+                    ui.column(.{ .grow = 1, .main = .center }, .{
+                        ui.text(.{}, info.kind.displayName()),
+                        mutedParagraph(ui, agentStatusCaption(info, model.codex_trust_note, model.dsh_busy, model.dsh_error)),
+                    }),
+                    trailing,
                 }),
-                trailing,
+                if (info.status == .current)
+                    agent_rail.statusStrip(ui, &model.rail, info.kind.hookAgentName(), i, .{
+                        .ready = icons.ready,
+                        .image = icons.image,
+                        .rect = icons.rect,
+                        .index = &app.agentIconIndex,
+                    })
+                else
+                    ui.el(.stack, .{}, .{}),
             }),
         });
         count += 1;

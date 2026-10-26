@@ -662,6 +662,18 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             }
         }
     }
+    // One row, two CLIs: connected only when both hook files are in place,
+    // outdated (Update) when just one is.
+    const gemini = &out[@intFromEnum(AgentKind.gemini)];
+    if (gemini.status != .absent) {
+        const antigravity = antigravityStatus(allocator, home);
+        gemini.status = if (gemini.status == .current and antigravity == .current)
+            .current
+        else if (gemini.status == .current or antigravity == .current)
+            .node
+        else
+            gemini.status;
+    }
     return out;
 }
 
@@ -720,10 +732,131 @@ const gemini_events = [_]HookEvent{
     .{ .event = "SessionEnd", .phase = "stop" },
 };
 
-pub fn installGemini(allocator: std.mem.Allocator, home: []const u8) bool {
+/// Gemini CLI's settings.json hooks only.
+fn installGeminiSettings(allocator: std.mem.Allocator, home: []const u8) bool {
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
     return installJsonHooks(allocator, path, &gemini_events, "gemini", 2000, true);
+}
+
+/// The Gemini row covers both CLIs: Gemini CLI reads settings.json, while
+/// its successor Antigravity (CLI and IDE) never does and reads its own
+/// hooks.json instead.
+pub fn installGemini(allocator: std.mem.Allocator, home: []const u8) bool {
+    const settings = installGeminiSettings(allocator, home);
+    const antigravity = installAntigravity(allocator, home);
+    return settings and antigravity;
+}
+
+// ------------------------------------------------------------ antigravity
+
+/// Antigravity's own hook names. Tool events take matcher groups, the rest
+/// take handlers directly. Phases reuse the Gemini vocabulary: an
+/// invocation is one model call inside a turn, and Stop ends the turn.
+const AntigravityEvent = struct { event: []const u8, phase: []const u8, grouped: bool };
+const antigravity_events = [_]AntigravityEvent{
+    .{ .event = "SessionStart", .phase = "session-start", .grouped = false },
+    .{ .event = "PreInvocation", .phase = "pre-llm", .grouped = false },
+    .{ .event = "PreToolUse", .phase = "pre", .grouped = true },
+    .{ .event = "PostToolUse", .phase = "post", .grouped = true },
+    .{ .event = "PostInvocation", .phase = "post-model", .grouped = false },
+    .{ .event = "Stop", .phase = "stop", .grouped = false },
+};
+
+/// The key Petdex owns inside the shared hooks.json.
+const antigravity_hook_name = "petdex";
+
+fn antigravityHooksPath(buf: []u8, home: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.gemini/config/hooks.json", .{home}) catch null;
+}
+
+fn antigravityHandler(a: std.mem.Allocator, phase: []const u8) ?std.json.Value {
+    var cmd_buf: [512]u8 = undefined;
+    const cmd = canonicalCommand(&cmd_buf, phase, "gemini") orelse return null;
+    var handler = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null;
+    handler.put(a, "type", .{ .string = "command" }) catch return null;
+    handler.put(a, "command", .{ .string = a.dupe(u8, cmd) catch return null }) catch return null;
+    handler.put(a, "timeout", .{ .integer = 2 }) catch return null;
+    return .{ .object = handler };
+}
+
+pub fn installAntigravity(allocator: std.mem.Allocator, home: []const u8) bool {
+    var path_buf: [512]u8 = undefined;
+    const path = antigravityHooksPath(&path_buf, home) orelse return false;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    defer if (existing) |e| allocator.free(e);
+    // Same rule as installJsonHooks: never overwrite a file we cannot read.
+    if (existing == null and fileExists(path)) return false;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var root: std.json.Value = blk: {
+        if (existing) |bytes| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false;
+            if (parsed != .object) return false;
+            break :blk parsed;
+        }
+        break :blk emptyObject(a);
+    };
+    if (existing != null and !backupOnce(allocator, path)) return false;
+
+    var ours = std.json.ObjectMap.init(a, &.{}, &.{}) catch return false;
+    for (antigravity_events) |ev| {
+        var list = std.json.Array.init(a);
+        const handler = antigravityHandler(a, ev.phase) orelse return false;
+        if (ev.grouped) {
+            var inner = std.json.Array.init(a);
+            inner.append(handler) catch return false;
+            var group = std.json.ObjectMap.init(a, &.{}, &.{}) catch return false;
+            group.put(a, "matcher", .{ .string = ".*" }) catch return false;
+            group.put(a, "hooks", .{ .array = inner }) catch return false;
+            list.append(.{ .object = group }) catch return false;
+        } else {
+            list.append(handler) catch return false;
+        }
+        ours.put(a, ev.event, .{ .array = list }) catch return false;
+    }
+    root.object.put(a, antigravity_hook_name, .{ .object = ours }) catch return false;
+
+    plat.makeDir(std.fs.path.dirname(path) orelse return false);
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    return writeFile(path, serialized);
+}
+
+fn uninstallAntigravity(allocator: std.mem.Allocator, home: []const u8) bool {
+    var path_buf: [512]u8 = undefined;
+    const path = antigravityHooksPath(&path_buf, home) orelse return false;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+    defer allocator.free(existing);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{}) catch return false;
+    if (root != .object) return false;
+    if (!root.object.orderedRemove(antigravity_hook_name)) return true;
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    return writeFile(path, serialized);
+}
+
+fn antigravityStatus(allocator: std.mem.Allocator, home: []const u8) HookStatus {
+    var path_buf: [512]u8 = undefined;
+    const path = antigravityHooksPath(&path_buf, home) orelse return .none;
+    const content = readFileAlloc(allocator, path, 512 * 1024) orelse return .none;
+    defer allocator.free(content);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}) catch return .none;
+    if (root != .object) return .none;
+    const ours = root.object.get(antigravity_hook_name) orelse return .none;
+    if (ours != .object) return .none;
+    // Every event must be present, so an older partial install reads as
+    // outdated and Update completes it.
+    for (antigravity_events) |ev| {
+        if (ours.object.get(ev.event) == null) return .none;
+    }
+    return .current;
 }
 
 // ------------------------------------------------------------------ omp
@@ -2180,7 +2313,9 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
         const migrated = switch (info.kind) {
             .claude_code => installClaude(allocator, home),
             .codex => installCodex(allocator, home),
-            .gemini => installGemini(allocator, home),
+            // Only the legacy settings.json hooks migrate silently; the
+            // Antigravity hooks file is added when the user presses Update.
+            .gemini => installGeminiSettings(allocator, home),
             // An outdated OpenCode plugin has no subprocess stdin path.
             // Keep its existing explicit Update action rather than changing
             // it as part of this bubble-runner migration.
@@ -2208,7 +2343,8 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
         },
         .gemini => {
             const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
-            return uninstallJsonHooks(allocator, path);
+            const settings = uninstallJsonHooks(allocator, path);
+            return uninstallAntigravity(allocator, home) and settings;
         },
         .codex => {
             // The config.toml feature flag stays harmless without the file.
@@ -3697,4 +3833,31 @@ test "Hermes uninstall preserves a user-modified plugin" {
     const plugin_after = readFileAlloc(t.allocator, init_file, 1024 * 1024).?;
     defer t.allocator.free(plugin_after);
     try t.expectEqualStrings("user-owned plugin\n", plugin_after);
+}
+
+test "Antigravity hooks install beside user hooks and report one Gemini row" {
+    const home = ".zig-cache/petdex-agenthooks-antigravity";
+    defer _ = plat.deleteTree(home);
+    plat.makeDir(home ++ "/.gemini/config");
+    const config = home ++ "/.gemini/config/hooks.json";
+    try t.expect(plat.writeFile(config, "{\"mine\":{\"Stop\":[{\"command\":\"echo done\"}]}}"));
+
+    try t.expect(installGemini(t.allocator, home));
+    var agents = scan(t.allocator, home);
+    try t.expectEqual(HookStatus.current, agents[@intFromEnum(AgentKind.gemini)].status);
+
+    const written = readFileAlloc(t.allocator, config, 64 * 1024).?;
+    defer t.allocator.free(written);
+    try t.expect(std.mem.indexOf(u8, written, "echo done") != null);
+    try t.expect(std.mem.indexOf(u8, written, "PreInvocation") != null);
+    try t.expect(std.mem.indexOf(u8, written, "petdex-hook") != null);
+
+    // Losing the Antigravity half leaves the row outdated, not connected.
+    try t.expect(uninstallAntigravity(t.allocator, home));
+    agents = scan(t.allocator, home);
+    try t.expectEqual(HookStatus.node, agents[@intFromEnum(AgentKind.gemini)].status);
+    const after = readFileAlloc(t.allocator, config, 64 * 1024).?;
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "echo done") != null);
+    try t.expect(std.mem.indexOf(u8, after, "petdex-hook") == null);
 }

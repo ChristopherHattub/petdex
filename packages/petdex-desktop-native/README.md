@@ -84,7 +84,7 @@ working, yellow while it waits on a permission prompt or question, green once
 the turn ends. With two or more sessions of the same agent the tab extends to
 the right at that row, with a small ringed icon per session. Finished
 sessions stay for ten minutes, then drop off. The tab moves to the left of
-the pet near the right screen edge and hides in Focus Mode. macOS and
+the pet near the right screen edge and stays visible in Focus Mode. macOS and
 Windows only for now. Code: `src/agent_rail.zig`.
 
 ## Phone and watch notifications (ntfy, opt-in)

@@ -12,7 +12,9 @@
 //! mode) or expired by the bubble lifetime, and a finished agent should
 //! still show green for a while after its card is gone.
 //!
-//! One row per agent type (Claude Code, Gemini/Antigravity, Codex, ...).
+//! The tab is always on screen: it keeps a row for Claude Code,
+//! Gemini/Antigravity and Codex even when none of them is running (a grey
+//! idle ring), and adds a row for any other agent while it has a session.
 //! The row's ring shows the most urgent state among its sessions. When an
 //! agent has two or more live sessions the tab grows to the right at that
 //! row with a small ringed icon per session.
@@ -243,16 +245,22 @@ pub fn expire(model: *Model, now_ms: i64) bool {
 // -------------------------------------------------------------- grouping
 
 pub const Group = struct {
-    /// Index of the first member; its agent name stands for the row.
-    first: usize,
-    count: usize,
-    /// Most urgent member status: waiting, then working, then done.
-    status: Status,
+    /// Hook name that stands for the row. Points at a literal or at an
+    /// entry of the model the groups were computed from.
+    name: []const u8,
+    count: usize = 0,
+    /// Most urgent member status: waiting, then working, then done. Idle
+    /// for a row with no live session.
+    status: Status = .idle,
     members: [max_entries]u8 = @splat(0),
 };
 
+/// Rows that are always shown, in this order.
+const default_rows = [_][]const u8{ "claude-code", "gemini", "codex" };
+pub const max_groups = max_entries + default_rows.len;
+
 pub const Groups = struct {
-    items: [max_entries]Group = undefined,
+    items: [max_groups]Group = undefined,
     len: usize = 0,
 
     pub fn slice(self: *const Groups) []const Group {
@@ -277,44 +285,24 @@ fn sameAgent(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-/// Fixed row order for the agents Chris runs day to day, so a row never
-/// jumps when another agent starts. Everything else follows in first-seen
-/// order.
-fn rowRank(name: []const u8) u8 {
-    const kind = app.agentKindForName(name) orelse return 3;
-    return switch (kind) {
-        .claude_code => 0,
-        .gemini => 1,
-        .codex => 2,
-        else => 3,
-    };
-}
-
 pub fn groupsOf(model: *const Model) Groups {
     var groups: Groups = .{};
+    for (default_rows) |name| {
+        groups.items[groups.len] = .{ .name = name };
+        groups.len += 1;
+    }
     for (model.entries[0..model.len], 0..) |*entry, index| {
         const found = for (groups.items[0..groups.len]) |*group| {
-            if (sameAgent(model.entries[group.first].agentSlice(), entry.agentSlice())) break group;
+            if (sameAgent(group.name, entry.agentSlice())) break group;
         } else null;
         const group = found orelse blk: {
-            groups.items[groups.len] = .{ .first = index, .count = 0, .status = entry.status };
+            groups.items[groups.len] = .{ .name = entry.agentSlice() };
             groups.len += 1;
             break :blk &groups.items[groups.len - 1];
         };
         group.members[group.count] = @intCast(index);
         group.count += 1;
         if (urgency(entry.status) > urgency(group.status)) group.status = entry.status;
-    }
-    // Stable insertion sort by rank.
-    var i: usize = 1;
-    while (i < groups.len) : (i += 1) {
-        const item = groups.items[i];
-        const rank = rowRank(model.entries[item.first].agentSlice());
-        var j = i;
-        while (j > 0 and rowRank(model.entries[groups.items[j - 1].first].agentSlice()) > rank) : (j -= 1) {
-            groups.items[j] = groups.items[j - 1];
-        }
-        groups.items[j] = item;
     }
     return groups;
 }
@@ -376,7 +364,8 @@ pub fn windowHeight(model: *const Model) f32 {
 }
 
 pub fn active(model: *const Model) bool {
-    return platform_supported and model.len > 0;
+    _ = model;
+    return platform_supported;
 }
 
 /// Vertically centered on the pet, on whichever side currently fits. On
@@ -441,11 +430,12 @@ fn agentLabel(name: []const u8) []const u8 {
     return if (name.len > 0) name else "Agent";
 }
 
-var group_labels: [max_entries][96]u8 = undefined;
+var group_labels: [max_groups][96]u8 = undefined;
 var member_labels: [max_entries][96]u8 = undefined;
 
 fn groupLabel(model: *const Model, group: *const Group, slot: usize) []const u8 {
-    const name = agentLabel(model.entries[group.first].agentSlice());
+    _ = model;
+    const name = agentLabel(group.name);
     if (group.count > 1) {
         return std.fmt.bufPrint(&group_labels[slot], "{s}: {d} sessions, {s}", .{ name, group.count, group.status.label() }) catch name;
     }
@@ -519,11 +509,10 @@ fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: Ico
 pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
     const groups = groupsOf(model);
     const ext_w = maxExtWidth(&groups);
-    var cells: [max_entries]AppUi.Node = undefined;
-    var slots: [max_entries]AppUi.Node = undefined;
+    var cells: [max_groups]AppUi.Node = undefined;
+    var slots: [max_groups]AppUi.Node = undefined;
     for (groups.slice(), 0..) |*group, slot| {
-        const lead = &model.entries[group.first];
-        cells[slot] = ringedIcon(ui, lead.agentSlice(), group.status, groupLabel(model, group, slot), main_sizes, icons);
+        cells[slot] = ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons);
         // Each slot is a little taller than the ring and the gaps shrink to
         // match, so the extension overhangs the row without moving it.
         const body = if (group.count > 1)
@@ -683,10 +672,45 @@ test "one row per agent type in the fixed order, one session each" {
     });
     const groups = groupsOf(&model);
     try std.testing.expectEqual(@as(usize, 3), groups.len);
-    try std.testing.expectEqualStrings("claude-code", model.entries[groups.items[0].first].agentSlice());
-    try std.testing.expectEqualStrings("gemini", model.entries[groups.items[1].first].agentSlice());
-    try std.testing.expectEqualStrings("codex", model.entries[groups.items[2].first].agentSlice());
+    try std.testing.expectEqualStrings("claude-code", groups.items[0].name);
+    try std.testing.expectEqualStrings("gemini", groups.items[1].name);
+    try std.testing.expectEqualStrings("codex", groups.items[2].name);
+    try std.testing.expectEqual(Status.done, groups.items[0].status);
+    try std.testing.expectEqual(Status.waiting, groups.items[1].status);
+    try std.testing.expectEqual(Status.working, groups.items[2].status);
     try std.testing.expectEqual(@as(f32, 0), maxExtWidth(&groups));
+}
+
+test "the tab is always there: three idle rows with no sessions" {
+    const model: Model = .{};
+    try std.testing.expectEqual(platform_supported, active(&model));
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    for (groups.slice()) |group| {
+        try std.testing.expectEqual(@as(usize, 0), group.count);
+        try std.testing.expectEqual(Status.idle, group.status);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ui = AppUi.init(arena.allocator());
+    const root = railView(&ui, &model, test_icons);
+    const column = root.nodes[0].nodes[0];
+    try std.testing.expectEqual(@as(usize, 3), column.nodes.len);
+    try std.testing.expectEqual(ringColor(.idle), column.nodes[0].widget.style.border);
+    try std.testing.expectEqualStrings("Codex: idle", column.nodes[2].widget.semantics.label);
+}
+
+test "other agents get a row after the three defaults only while live" {
+    var model = testModel(&.{testBubble("a", "opencode", .running)});
+    var groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 4), groups.len);
+    try std.testing.expectEqualStrings("opencode", groups.items[3].name);
+    try std.testing.expectEqual(Status.working, groups.items[3].status);
+    var out: [max_entries]Transition = undefined;
+    _ = reconcile(&model, &.{}, 10, &out);
+    _ = expire(&model, 10 + done_linger_ms);
+    groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
 }
 
 test "several sessions of one agent share a row and the strongest status wins" {
@@ -697,10 +721,11 @@ test "several sessions of one agent share a row and the strongest status wins" {
         testBubble("d", "codex", .running),
     });
     const groups = groupsOf(&model);
-    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
     try std.testing.expectEqual(@as(usize, 3), groups.items[0].count);
     try std.testing.expectEqual(Status.waiting, groups.items[0].status);
-    try std.testing.expectEqual(@as(usize, 1), groups.items[1].count);
+    try std.testing.expectEqual(@as(usize, 0), groups.items[1].count);
+    try std.testing.expectEqual(@as(usize, 1), groups.items[2].count);
     try std.testing.expect(extWidth(3) > extWidth(2));
     try std.testing.expectEqual(@as(f32, 0), extWidth(1));
     try std.testing.expectEqual(baseWidth() + extWidth(3), windowWidth(&model));
@@ -711,7 +736,9 @@ test "antigravity and gemini are the same row" {
         testBubble("a", "gemini", .running),
         testBubble("b", "antigravity", .running),
     });
-    try std.testing.expectEqual(@as(usize, 1), groupsOf(&model).len);
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqual(@as(usize, 2), groups.items[1].count);
 }
 
 test "sessionless agents stay separate entries" {
@@ -722,7 +749,9 @@ test "sessionless agents stay separate entries" {
     // An empty conversation key matches any agent in `BubbleIdentity`;
     // the rail must not fold codex into the claude entry.
     try std.testing.expectEqual(@as(usize, 2), model.len);
-    try std.testing.expectEqual(@as(usize, 2), groupsOf(&model).len);
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 1), groups.items[0].count);
+    try std.testing.expectEqual(@as(usize, 1), groups.items[2].count);
 }
 
 test "rail view draws a ring per row and an extension for a busy agent" {

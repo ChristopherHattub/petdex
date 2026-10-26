@@ -3248,6 +3248,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             drainPendingInstall(model, fx);
             sdk_log.tick(fx.wallMs());
             if (!model.sheet_loaded) return;
+            // The rail draws before any agent speaks, so its logos cannot
+            // wait for the first drained bubble.
+            if (railShown(model)) loadAgentsAtlas(model.dark, fx);
             if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
@@ -3259,7 +3262,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 var rail_edges: [agent_rail.max_entries]agent_rail.Transition = undefined;
                 const edge_count = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
                 ntfy.onTransitions(&model.ntfy, fx, &model.rail, rail_edges[0..edge_count], drained[0..raw_count], now);
-                if (railShown(model)) loadAgentsAtlas(model.dark, fx);
                 if (model.settings_open) {
                     for (drained[0..raw_count]) |bubble| {
                         if (std.mem.eql(u8, bubble.agent[0..bubble.agent_len], "dsh")) {
@@ -4916,9 +4918,9 @@ fn flockBadge(ui: *AppUi, member: *const flock_mod.Member) AppUi.Node {
 
 // ------------------------------------------------------------ agent rail
 
-/// Focus mode silences the pet's chatter; the rail goes with it.
+/// Always on, focus mode included: it is a status display, not chatter.
 fn railShown(model: *const Model) bool {
-    return agent_rail.active(&model.rail) and !model.focus_mode and model.sheet_loaded;
+    return agent_rail.active(&model.rail) and model.sheet_loaded;
 }
 
 fn syncRailWindow(model: *Model, fx: *Effects) void {

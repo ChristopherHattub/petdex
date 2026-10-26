@@ -77,9 +77,12 @@ are disabled for that run. Correct the file and restart Petdex to try again.
 
 ## Agent rail
 
-A translucent tab to the right of the pet shows one logo per live agent
-session. The ring says what it is doing: red while working, yellow while it
-waits on a permission prompt or question, green once the turn ends. Finished
+A translucent tab to the right of the pet with one row per agent type
+(Claude Code, Gemini CLI / Antigravity, Codex, then any others). The row's
+ring is the most urgent state among that agent's sessions: red while
+working, yellow while it waits on a permission prompt or question, green once
+the turn ends. With two or more sessions of the same agent the tab extends to
+the right at that row, with a small ringed icon per session. Finished
 sessions stay for ten minutes, then drop off. The tab moves to the left of
 the pet near the right screen edge and hides in Focus Mode. macOS and
 Windows only for now. Code: `src/agent_rail.zig`.

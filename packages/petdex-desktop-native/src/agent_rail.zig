@@ -12,6 +12,11 @@
 //! mode) or expired by the bubble lifetime, and a finished agent should
 //! still show green for a while after its card is gone.
 //!
+//! One row per agent type (Claude Code, Gemini/Antigravity, Codex, ...).
+//! The row's ring shows the most urgent state among its sessions. When an
+//! agent has two or more live sessions the tab grows to the right at that
+//! row with a small ringed icon per session.
+//!
 //! Kept in its own file, like settings_view.zig, so main.zig only gains a
 //! few call sites and rebases onto upstream stay small.
 
@@ -161,6 +166,7 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
         };
         seen[index] = true;
         const entry = &model.entries[index];
+        copyInto(&entry.agent, &entry.agent_len, bubble.agent[0..bubble.agent_len]);
         if (entry.status != next) {
             if (transitions < max_entries) {
                 out[transitions] = .{ .index = index, .from = entry.status, .to = next };
@@ -185,7 +191,12 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
 
 fn indexOf(model: *const Model, identity: hook_server.BubbleIdentity) ?usize {
     for (model.entries[0..model.len], 0..) |*entry, index| {
-        if (entry.identity().matches(identity)) return index;
+        if (!entry.identity().matches(identity)) continue;
+        // `matches` treats an empty conversation key as a wildcard for any
+        // agent (the legacy shared slot). Rows are per agent, so two
+        // sessionless agents must stay two entries.
+        if (identity.conversation_key.len == 0 and !std.ascii.eqlIgnoreCase(entry.agentSlice(), identity.agent)) continue;
+        return index;
     }
     return null;
 }
@@ -229,6 +240,85 @@ pub fn expire(model: *Model, now_ms: i64) bool {
     return changed;
 }
 
+// -------------------------------------------------------------- grouping
+
+pub const Group = struct {
+    /// Index of the first member; its agent name stands for the row.
+    first: usize,
+    count: usize,
+    /// Most urgent member status: waiting, then working, then done.
+    status: Status,
+    members: [max_entries]u8 = @splat(0),
+};
+
+pub const Groups = struct {
+    items: [max_entries]Group = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const Groups) []const Group {
+        return self.items[0..self.len];
+    }
+};
+
+fn urgency(status: Status) u8 {
+    return switch (status) {
+        .waiting => 3,
+        .working => 2,
+        .done => 1,
+        .idle => 0,
+    };
+}
+
+fn sameAgent(a: []const u8, b: []const u8) bool {
+    const ka = app.agentKindForName(a);
+    const kb = app.agentKindForName(b);
+    if (ka != null and kb != null) return ka.? == kb.?;
+    if (ka != null or kb != null) return false;
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// Fixed row order for the agents Chris runs day to day, so a row never
+/// jumps when another agent starts. Everything else follows in first-seen
+/// order.
+fn rowRank(name: []const u8) u8 {
+    const kind = app.agentKindForName(name) orelse return 3;
+    return switch (kind) {
+        .claude_code => 0,
+        .gemini => 1,
+        .codex => 2,
+        else => 3,
+    };
+}
+
+pub fn groupsOf(model: *const Model) Groups {
+    var groups: Groups = .{};
+    for (model.entries[0..model.len], 0..) |*entry, index| {
+        const found = for (groups.items[0..groups.len]) |*group| {
+            if (sameAgent(model.entries[group.first].agentSlice(), entry.agentSlice())) break group;
+        } else null;
+        const group = found orelse blk: {
+            groups.items[groups.len] = .{ .first = index, .count = 0, .status = entry.status };
+            groups.len += 1;
+            break :blk &groups.items[groups.len - 1];
+        };
+        group.members[group.count] = @intCast(index);
+        group.count += 1;
+        if (urgency(entry.status) > urgency(group.status)) group.status = entry.status;
+    }
+    // Stable insertion sort by rank.
+    var i: usize = 1;
+    while (i < groups.len) : (i += 1) {
+        const item = groups.items[i];
+        const rank = rowRank(model.entries[item.first].agentSlice());
+        var j = i;
+        while (j > 0 and rowRank(model.entries[groups.items[j - 1].first].agentSlice()) > rank) : (j -= 1) {
+            groups.items[j] = groups.items[j - 1];
+        }
+        groups.items[j] = item;
+    }
+    return groups;
+}
+
 // ------------------------------------------------------------- geometry
 
 const icon_px: f32 = 26;
@@ -238,18 +328,50 @@ const cell_px: f32 = icon_px + (ring_px + ring_gap) * 2;
 const tab_padding: f32 = 7;
 const tab_gap: f32 = 6;
 const tab_radius: f32 = 12;
+/// Per-session icons in an extended row.
+const mini_icon_px: f32 = 14;
+const mini_ring_px: f32 = 1.5;
+const mini_ring_gap: f32 = 1;
+const mini_cell_px: f32 = mini_icon_px + (mini_ring_px + mini_ring_gap) * 2;
+const mini_gap: f32 = 4;
+const ext_pad: f32 = 6;
+/// The extension is a little taller than the main ring so it reads as
+/// part of the tab rather than a chip beside it.
+const ext_overhang: f32 = 2;
+const ext_h: f32 = cell_px + ext_overhang * 2;
+const ext_radius: f32 = 10;
 /// Space between the pet's edge and the tab.
 pub const pet_gap: f64 = 4;
 /// How far the pet must travel back from the edge before the rail
 /// returns to its right side.
 const flip_hysteresis: f64 = 48;
 
-pub fn windowWidth() f32 {
+pub fn baseWidth() f32 {
     return cell_px + tab_padding * 2;
 }
 
-pub fn windowHeight(count: usize) f32 {
-    const n: f32 = @floatFromInt(@max(count, 1));
+/// Width of the extension for a row with `sessions` live sessions; zero
+/// until there is more than one to tell apart.
+pub fn extWidth(sessions: usize) f32 {
+    if (sessions < 2) return 0;
+    const n: f32 = @floatFromInt(sessions);
+    return n * mini_cell_px + (n - 1) * mini_gap + ext_pad * 2;
+}
+
+fn maxExtWidth(groups: *const Groups) f32 {
+    var widest: f32 = 0;
+    for (groups.slice()) |group| widest = @max(widest, extWidth(group.count));
+    return widest;
+}
+
+pub fn windowWidth(model: *const Model) f32 {
+    const groups = groupsOf(model);
+    return baseWidth() + maxExtWidth(&groups);
+}
+
+pub fn windowHeight(model: *const Model) f32 {
+    const groups = groupsOf(model);
+    const n: f32 = @floatFromInt(@max(groups.len, 1));
     return n * cell_px + (n - 1) * tab_gap + tab_padding * 2;
 }
 
@@ -257,10 +379,12 @@ pub fn active(model: *const Model) bool {
     return platform_supported and model.len > 0;
 }
 
-/// Vertically centered on the pet, on whichever side currently fits.
+/// Vertically centered on the pet, on whichever side currently fits. On
+/// the left the whole window moves out by the extension width so the base
+/// column stays next to the pet.
 pub fn wantOrigin(model: *const Model, pet_x: f64, pet_y: f64, pet_w: f64, pet_h: f64) struct { x: f64, y: f64 } {
-    const w: f64 = windowWidth();
-    const h: f64 = windowHeight(model.len);
+    const w: f64 = windowWidth(model);
+    const h: f64 = windowHeight(model);
     const x = if (model.on_left) pet_x - w - pet_gap else pet_x + pet_w + pet_gap;
     return .{ .x = x, .y = pet_y + (pet_h - h) / 2.0 };
 }
@@ -270,8 +394,8 @@ pub fn wantOrigin(model: *const Model, pet_x: f64, pet_y: f64, pet_w: f64, pet_h
 /// right side ran off the display.
 pub fn sync(model: *Model, fx: *app.Effects, pet_x: f64, pet_y: f64, pet_w: f64, pet_h: f64) void {
     if (!active(model)) return;
-    const w = windowWidth();
-    const h = windowHeight(model.len);
+    const w = windowWidth(model);
+    const h = windowHeight(model);
     if (@abs(w - model.window_w) > 0.5 or @abs(h - model.window_h) > 0.5) {
         _ = fx.resizeWindow(window_label, w, h, .top_left);
         model.window_w = w;
@@ -312,54 +436,121 @@ pub fn ringColor(status: Status) canvas.Color {
     };
 }
 
-var label_scratch: [max_entries][64]u8 = undefined;
-
-fn semanticLabel(entry: *const Entry, slot: usize) []const u8 {
-    return std.fmt.bufPrint(&label_scratch[slot], "{s}: {s}", .{ entry.agentSlice(), entry.status.label() }) catch entry.agentSlice();
+fn agentLabel(name: []const u8) []const u8 {
+    if (app.agentKindForName(name)) |kind| return kind.displayName();
+    return if (name.len > 0) name else "Agent";
 }
 
-fn railIcon(ui: *AppUi, entry: *const Entry, slot: usize, icons: IconAtlas) AppUi.Node {
-    const name = entry.agentSlice();
+var group_labels: [max_entries][96]u8 = undefined;
+var member_labels: [max_entries][96]u8 = undefined;
+
+fn groupLabel(model: *const Model, group: *const Group, slot: usize) []const u8 {
+    const name = agentLabel(model.entries[group.first].agentSlice());
+    if (group.count > 1) {
+        return std.fmt.bufPrint(&group_labels[slot], "{s}: {d} sessions, {s}", .{ name, group.count, group.status.label() }) catch name;
+    }
+    return std.fmt.bufPrint(&group_labels[slot], "{s}: {s}", .{ name, group.status.label() }) catch name;
+}
+
+fn memberLabel(entry: *const Entry, slot: usize) []const u8 {
+    const name = agentLabel(entry.agentSlice());
+    return std.fmt.bufPrint(&member_labels[slot], "{s}: {s}", .{ name, entry.status.label() }) catch name;
+}
+
+const RingSizes = struct { icon: f32, ring: f32, gap: f32 };
+
+const main_sizes: RingSizes = .{ .icon = icon_px, .ring = ring_px, .gap = ring_gap };
+const mini_sizes: RingSizes = .{ .icon = mini_icon_px, .ring = mini_ring_px, .gap = mini_ring_gap };
+
+fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, sizes: RingSizes, icons: IconAtlas) AppUi.Node {
+    const cell = sizes.icon + (sizes.ring + sizes.gap) * 2;
     const glyph = if (icons.ready) blk: {
-        var image = ui.image(.{ .width = icon_px, .height = icon_px, .image = icons.image });
-        image.widget.image_src = icons.rect(icons.index(name));
+        var image = ui.image(.{ .width = sizes.icon, .height = sizes.icon, .image = icons.image });
+        image.widget.image_src = icons.rect(icons.index(agent));
         image.widget.image_fit = .contain;
         break :blk image;
     } else blk: {
         // Before the strip decodes, an initial keeps the slot readable.
-        var text = ui.text(.{ .size = .sm, .text_alignment = .center }, if (name.len > 0) name[0..1] else "?");
+        var text = ui.text(.{ .size = .sm, .text_alignment = .center }, if (agent.len > 0) agent[0..1] else "?");
         text.widget.style.foreground = canvas.Color.rgb8(237, 237, 238);
         break :blk text;
     };
     var ring = ui.el(.panel, .{
-        .width = cell_px,
-        .height = cell_px,
-        .padding = ring_px + ring_gap,
+        .width = cell,
+        .height = cell,
+        .padding = sizes.ring + sizes.gap,
         .main = .center,
         .cross = .center,
-        .semantics = .{ .label = semanticLabel(entry, slot) },
+        .semantics = .{ .label = label },
     }, .{glyph});
-    ring.widget.style.radius = cell_px / 2;
+    ring.widget.style.radius = cell / 2;
     ring.widget.style.background = canvas.Color.rgba8(255, 255, 255, 18);
-    ring.widget.style.border = ringColor(entry.status);
-    ring.widget.style.stroke_width = ring_px;
+    ring.widget.style.border = ringColor(status);
+    ring.widget.style.stroke_width = sizes.ring;
     return ring;
 }
 
+fn styleTab(node: *AppUi.Node, radius: f32) void {
+    node.widget.style.radius = radius;
+    node.widget.style.background = canvas.Color.rgba8(0, 0, 0, 150);
+    node.widget.style.border = canvas.Color.rgba8(255, 255, 255, 22);
+    node.widget.style.stroke_width = 1;
+}
+
+/// The extension for one row: a small ring per session, same translucent
+/// black as the tab it grows out of.
+fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: IconAtlas) AppUi.Node {
+    var minis: [max_entries]AppUi.Node = undefined;
+    for (group.members[0..group.count], 0..) |member, i| {
+        const entry = &model.entries[member];
+        minis[i] = ringedIcon(ui, entry.agentSlice(), entry.status, memberLabel(entry, member), mini_sizes, icons);
+    }
+    var panel = ui.el(.panel, .{
+        .width = extWidth(group.count),
+        .height = ext_h,
+        .padding = 0,
+        .main = .center,
+        .cross = .center,
+    }, .{ui.row(.{ .gap = mini_gap, .cross = .center }, @as([]const AppUi.Node, minis[0..group.count]))});
+    styleTab(&panel, ext_radius);
+    return panel;
+}
+
 pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
-    var icons_nodes: [max_entries]AppUi.Node = undefined;
-    for (model.entries[0..model.len], 0..) |*entry, slot| icons_nodes[slot] = railIcon(ui, entry, slot, icons);
-    var tab = ui.el(.panel, .{
+    const groups = groupsOf(model);
+    const ext_w = maxExtWidth(&groups);
+    var cells: [max_entries]AppUi.Node = undefined;
+    var slots: [max_entries]AppUi.Node = undefined;
+    for (groups.slice(), 0..) |*group, slot| {
+        const lead = &model.entries[group.first];
+        cells[slot] = ringedIcon(ui, lead.agentSlice(), group.status, groupLabel(model, group, slot), main_sizes, icons);
+        // Each slot is a little taller than the ring and the gaps shrink to
+        // match, so the extension overhangs the row without moving it.
+        const body = if (group.count > 1)
+            extensionFor(ui, model, group, icons)
+        else
+            ui.el(.stack, .{ .width = 1, .height = 1 }, .{});
+        slots[slot] = ui.row(.{
+            .width = ext_w,
+            .height = ext_h,
+            .main = if (model.on_left) .end else .start,
+            .cross = .center,
+        }, .{body});
+    }
+    var base = ui.el(.panel, .{
         .padding = tab_padding,
-        .width = windowWidth(),
-        .height = windowHeight(model.len),
+        .width = baseWidth(),
+        .height = windowHeight(model),
         .semantics = .{ .label = "Agent status" },
-    }, .{ui.column(.{ .gap = tab_gap, .cross = .center }, @as([]const AppUi.Node, icons_nodes[0..model.len]))});
-    tab.widget.style.radius = tab_radius;
-    tab.widget.style.background = canvas.Color.rgba8(0, 0, 0, 150);
-    tab.widget.style.border = canvas.Color.rgba8(255, 255, 255, 22);
-    tab.widget.style.stroke_width = 1;
-    return tab;
+    }, .{ui.column(.{ .gap = tab_gap, .cross = .center }, @as([]const AppUi.Node, cells[0..groups.len]))});
+    styleTab(&base, tab_radius);
+
+    const slot_gap = tab_gap - ext_overhang * 2;
+    const extras = ui.column(.{ .gap = slot_gap }, @as([]const AppUi.Node, slots[0..groups.len]));
+    const column_pad = ui.el(.stack, .{ .width = 1, .height = tab_padding - ext_overhang }, .{});
+    const extension_column = ui.column(.{}, .{ column_pad, extras });
+    if (model.on_left) return ui.row(.{ .cross = .start }, .{ extension_column, base });
+    return ui.row(.{ .cross = .start }, .{ base, extension_column });
 }
 
 // ---------------------------------------------------------------- tests
@@ -459,11 +650,13 @@ test "anonymous bubbles are not ringed" {
 test "rail origin sits right of the pet and centers vertically" {
     var model: Model = .{};
     model.len = 1;
+    model.entries[0].agent_len = 6;
+    @memcpy(model.entries[0].agent[0..6], "claude");
     const origin = wantOrigin(&model, 100, 200, 192, 208);
     try std.testing.expectEqual(@as(f64, 100 + 192 + pet_gap), origin.x);
-    try std.testing.expectEqual(@as(f64, 200 + (208 - @as(f64, windowHeight(1))) / 2), origin.y);
+    try std.testing.expectEqual(@as(f64, 200 + (208 - @as(f64, windowHeight(&model))) / 2), origin.y);
     model.on_left = true;
-    try std.testing.expectEqual(@as(f64, 100 - @as(f64, windowWidth()) - pet_gap), wantOrigin(&model, 100, 200, 192, 208).x);
+    try std.testing.expectEqual(@as(f64, 100 - @as(f64, windowWidth(&model)) - pet_gap), wantOrigin(&model, 100, 200, 192, 208).x);
 }
 
 fn testIconRect(index: usize) geometry.RectF {
@@ -473,23 +666,104 @@ fn testIconIndex(_: []const u8) usize {
     return 0;
 }
 
-test "rail view draws one ring per entry in its status colour" {
+const test_icons: IconAtlas = .{ .ready = true, .image = 9, .rect = &testIconRect, .index = &testIconIndex };
+
+fn testModel(live: []const hook_server.Bubble) Model {
     var model: Model = .{};
     var out: [max_entries]Transition = undefined;
-    const live = [_]hook_server.Bubble{
-        testBubble("a", "claude", .running),
-        testBubble("b", "codex", .needs_input),
-        testBubble("c", "gemini", .completed),
-    };
-    _ = reconcile(&model, &live, 0, &out);
+    _ = reconcile(&model, live, 0, &out);
+    return model;
+}
+
+test "one row per agent type in the fixed order, one session each" {
+    const model = testModel(&.{
+        testBubble("a", "codex", .running),
+        testBubble("b", "gemini", .needs_input),
+        testBubble("c", "claude-code", .completed),
+    });
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqualStrings("claude-code", model.entries[groups.items[0].first].agentSlice());
+    try std.testing.expectEqualStrings("gemini", model.entries[groups.items[1].first].agentSlice());
+    try std.testing.expectEqualStrings("codex", model.entries[groups.items[2].first].agentSlice());
+    try std.testing.expectEqual(@as(f32, 0), maxExtWidth(&groups));
+}
+
+test "several sessions of one agent share a row and the strongest status wins" {
+    const model = testModel(&.{
+        testBubble("a", "claude-code", .completed),
+        testBubble("b", "claude", .running),
+        testBubble("c", "claude-code", .needs_input),
+        testBubble("d", "codex", .running),
+    });
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqual(@as(usize, 3), groups.items[0].count);
+    try std.testing.expectEqual(Status.waiting, groups.items[0].status);
+    try std.testing.expectEqual(@as(usize, 1), groups.items[1].count);
+    try std.testing.expect(extWidth(3) > extWidth(2));
+    try std.testing.expectEqual(@as(f32, 0), extWidth(1));
+    try std.testing.expectEqual(baseWidth() + extWidth(3), windowWidth(&model));
+}
+
+test "antigravity and gemini are the same row" {
+    const model = testModel(&.{
+        testBubble("a", "gemini", .running),
+        testBubble("b", "antigravity", .running),
+    });
+    try std.testing.expectEqual(@as(usize, 1), groupsOf(&model).len);
+}
+
+test "sessionless agents stay separate entries" {
+    const model = testModel(&.{
+        testBubble("", "claude-code", .running),
+        testBubble("", "codex", .running),
+    });
+    // An empty conversation key matches any agent in `BubbleIdentity`;
+    // the rail must not fold codex into the claude entry.
+    try std.testing.expectEqual(@as(usize, 2), model.len);
+    try std.testing.expectEqual(@as(usize, 2), groupsOf(&model).len);
+}
+
+test "rail view draws a ring per row and an extension for a busy agent" {
+    const model = testModel(&.{
+        testBubble("a", "claude-code", .running),
+        testBubble("b", "claude-code", .completed),
+        testBubble("c", "codex", .needs_input),
+        testBubble("d", "gemini", .completed),
+    });
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var ui = AppUi.init(arena.allocator());
-    const tab = railView(&ui, &model, .{ .ready = true, .image = 9, .rect = &testIconRect, .index = &testIconIndex });
-    const column = tab.nodes[0];
+    const root = railView(&ui, &model, test_icons);
+    const column = root.nodes[0].nodes[0];
     try std.testing.expectEqual(@as(usize, 3), column.nodes.len);
+    // Claude: running beats done. Gemini row second, Codex third.
     try std.testing.expectEqual(ringColor(.working), column.nodes[0].widget.style.border);
-    try std.testing.expectEqual(ringColor(.waiting), column.nodes[1].widget.style.border);
-    try std.testing.expectEqual(ringColor(.done), column.nodes[2].widget.style.border);
-    try std.testing.expectEqualStrings("codex: waiting for you", column.nodes[1].widget.semantics.label);
+    try std.testing.expectEqual(ringColor(.done), column.nodes[1].widget.style.border);
+    try std.testing.expectEqual(ringColor(.waiting), column.nodes[2].widget.style.border);
+    try std.testing.expectEqualStrings("Claude Code: 2 sessions, working", column.nodes[0].widget.semantics.label);
+    // Only the Claude row grew: its slot holds a panel of two small rings.
+    const slots = root.nodes[1].nodes[1];
+    try std.testing.expectEqual(@as(usize, 3), slots.nodes.len);
+    const extension = slots.nodes[0].nodes[0];
+    const minis = extension.nodes[0];
+    try std.testing.expectEqual(@as(usize, 2), minis.nodes.len);
+    try std.testing.expectEqual(ringColor(.working), minis.nodes[0].widget.style.border);
+    try std.testing.expectEqual(ringColor(.done), minis.nodes[1].widget.style.border);
+}
+
+test "rail view mirrors when the pet is at the right edge" {
+    var model = testModel(&.{
+        testBubble("a", "codex", .running),
+        testBubble("b", "codex", .running),
+    });
+    model.on_left = true;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ui = AppUi.init(arena.allocator());
+    const root = railView(&ui, &model, test_icons);
+    // Extension column first, base tab last (next to the pet).
+    try std.testing.expectEqual(@as(usize, 2), root.nodes.len);
+    try std.testing.expectEqualStrings("Agent status", root.nodes[1].widget.semantics.label);
 }

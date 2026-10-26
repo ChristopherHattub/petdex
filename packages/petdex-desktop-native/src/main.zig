@@ -1581,7 +1581,7 @@ const AgentArt = struct { light: []const u8, dark: []const u8 };
 const agent_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/claude-code.png"), .dark = @embedFile("assets/agents/claude-code.png") },
     .{ .light = @embedFile("assets/agents/codex.png"), .dark = @embedFile("assets/agents/codex.png") },
-    .{ .light = @embedFile("assets/agents/gemini.png"), .dark = @embedFile("assets/agents/gemini.png") },
+    .{ .light = @embedFile("assets/agents/antigravity.png"), .dark = @embedFile("assets/agents/antigravity.png") },
     .{ .light = @embedFile("assets/agents/opencode-light.png"), .dark = @embedFile("assets/agents/opencode-dark.png") },
     .{ .light = @embedFile("assets/agents/qoder.png"), .dark = @embedFile("assets/agents/qoder.png") },
     .{ .light = @embedFile("assets/agents/kimi-code.png"), .dark = @embedFile("assets/agents/kimi-code.png") },
@@ -1729,7 +1729,7 @@ fn agentIconIndex(agent: []const u8) usize {
     return agent_fallback_index;
 }
 
-fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
+pub fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     for (std.enums.values(agent_hooks.AgentKind)) |kind| {
         if (std.mem.eql(u8, kind.hookAgentName(), agent)) return kind;
     }
@@ -1737,6 +1737,8 @@ fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     if (std.mem.eql(u8, agent, "open-code")) return .opencode;
     if (std.mem.eql(u8, agent, "qodercli")) return .qoder;
     if (std.mem.eql(u8, agent, "kimi")) return .kimi_code;
+    // Gemini CLI is now Antigravity; treat either spelling as one agent.
+    if (std.mem.eql(u8, agent, "antigravity")) return .gemini;
     return null;
 }
 
@@ -4943,8 +4945,8 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
             .label = agent_rail.window_label,
             .canvas_label = agent_rail.canvas_label,
             .title = "",
-            .width = agent_rail.windowWidth(),
-            .height = agent_rail.windowHeight(model.rail.len),
+            .width = agent_rail.windowWidth(&model.rail),
+            .height = agent_rail.windowHeight(&model.rail),
             .x = @floatCast(origin.x),
             .y = @floatCast(origin.y),
             .resizable = false,

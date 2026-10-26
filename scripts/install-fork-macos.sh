@@ -15,6 +15,17 @@ set -euo pipefail
 [ "$(uname -s)" = "Darwin" ] || { echo "macOS only" >&2; exit 1; }
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Self-update: pull the fork first, and restart this script if it changed,
+# so one command is always enough.
+if [ -z "${PETDEX_UPDATED:-}" ]; then
+  BEFORE="$(git -C "$REPO" rev-parse HEAD)"
+  git -C "$REPO" pull --ff-only --quiet || echo "warning: could not pull; building what is checked out" >&2
+  if [ "$BEFORE" != "$(git -C "$REPO" rev-parse HEAD)" ]; then
+    echo "Pulled new changes; restarting."
+    PETDEX_UPDATED=1 exec "$REPO/scripts/install-fork-macos.sh" "$@"
+  fi
+fi
 PKG="$REPO/packages/petdex-desktop-native"
 SRC="${PETDEX_SRC:-$HOME/src}"
 SDK_REF=c0b10d027efa490fc99a3bc7f1cf88b015999d45
@@ -90,12 +101,17 @@ xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 "$LSREGISTER" -f -R -trusted "$DEST" >/dev/null 2>&1 || true
 
+# Double-clickable updater on the Desktop: pull, rebuild, reinstall.
+LAUNCHER="$HOME/Desktop/Update Petdex.command"
+printf '#!/bin/bash\nexec "%s/scripts/install-fork-macos.sh" --yes\n' "$REPO" > "$LAUNCHER"
+chmod +x "$LAUNCHER"
+
 echo
 echo "Installed $DEST. Launching it now."
 open "$DEST"
 cat <<MSG
 
 Last step: Petdex menu -> Settings -> turn on 'Launch at login'.
-To update later: git pull, then re-run scripts/install-fork-macos.sh.
+To update later: double-click 'Update Petdex' on your Desktop (it pulls, rebuilds and reinstalls).
 Find leftovers with: mdfind "kMDItemCFBundleIdentifier == 'dev.petdex.desktop-native'"
 MSG

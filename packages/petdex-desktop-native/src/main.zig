@@ -197,6 +197,18 @@ pub fn sectionOpen(model: *const Model, section: Section) bool {
     return model.sections_open & (@as(u16, 1) << @as(u4, @intCast(@intFromEnum(section)))) != 0;
 }
 
+/// The other Agent-Pets row that has explicitly picked this catalog pet,
+/// if any. Each pet may belong to one agent at a time.
+pub fn agentPetTakenBy(model: *const Model, index: usize, slot: usize) ?usize {
+    if (index >= catalog_mod.catalog_len) return null;
+    const name = catalog_mod.catalog[index].slice();
+    for (0..agent_rail.pet_slots) |other| {
+        if (other == slot or model.agent_pet_name_len[other] == 0) continue;
+        if (std.mem.eql(u8, model.agent_pet_name[other][0..model.agent_pet_name_len[other]], name)) return other;
+    }
+    return null;
+}
+
 /// Catalog index of the pet an Agent-Pets row shows; the active pet
 /// until a row picks its own, or when that pet is no longer installed.
 pub fn agentPetCatalogIndex(model: *const Model, slot: usize) ?usize {
@@ -3258,6 +3270,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const slot: usize = packed_choice >> 16;
             const index: usize = packed_choice & 0xffff;
             if (slot >= agent_rail.pet_slots or index >= catalog_mod.catalog_len) return;
+            if (agentPetTakenBy(model, index, slot) != null) return;
             const name = catalog[index].slice();
             @memcpy(model.agent_pet_name[slot][0..name.len], name);
             model.agent_pet_name_len[slot] = @intCast(name.len);
@@ -7513,4 +7526,30 @@ test "choosing a pet for one agent leaves the other slots alone" {
     update(&model, .{ .set_agent_pet = (0 << 16) | 2 }, &fx);
     try std.testing.expectEqualStrings("gamma", model.agent_pet_name[0][0..model.agent_pet_name_len[0]]);
     try std.testing.expectEqualStrings("beta", model.agent_pet_name[2][0..model.agent_pet_name_len[2]]);
+}
+
+test "a pet already used by one agent cannot be given to another" {
+    var model: Model = .{};
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    const saved_len = catalog_mod.catalog_len;
+    const saved = catalog_mod.catalog;
+    defer {
+        catalog_mod.catalog_len = saved_len;
+        catalog_mod.catalog = saved;
+    }
+    const names = [_][]const u8{ "alpha", "beta" };
+    for (names, 0..) |name, i| {
+        @memcpy(catalog_mod.catalog[i].name[0..name.len], name);
+        catalog_mod.catalog[i].len = name.len;
+    }
+    catalog_mod.catalog_len = 2;
+    update(&model, .{ .set_agent_pet = (0 << 16) | 1 }, &fx);
+    try std.testing.expectEqual(@as(?usize, 0), agentPetTakenBy(&model, 1, 2));
+    try std.testing.expectEqual(@as(?usize, null), agentPetTakenBy(&model, 1, 0));
+    update(&model, .{ .set_agent_pet = (2 << 16) | 1 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.agent_pet_name_len[2]);
+    // Re-picking its own pet is still allowed.
+    update(&model, .{ .set_agent_pet = (0 << 16) | 1 }, &fx);
+    try std.testing.expectEqualStrings("beta", model.agent_pet_name[0][0..model.agent_pet_name_len[0]]);
 }

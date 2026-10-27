@@ -35,6 +35,7 @@ const flock_mod = @import("flock.zig");
 const agent_rail = @import("agent_rail.zig");
 const xp_mod = @import("xp.zig");
 const levelup_mod = @import("levelup.zig");
+const evolution = @import("evolution.zig");
 const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
@@ -1635,7 +1636,66 @@ const max_sheet_pixel_bytes: usize = 16 * 1024 * 1024;
 /// lives in the runtime's registry, not in the decoder, which honors
 /// whatever buffer the caller hands it. Loop-thread only, per the
 /// `PlatformServices.decodeImage` contract.
+/// Per catalog pet: the tint its current evolution wears, and the pet whose
+/// sprite stands in once a traditional line has moved on. Kept in step with
+/// the XP store by `refreshEvolution`; `decodeSheet` reads them.
+var evo_tint: [max_catalog]evolution.Tint = @splat(.none);
+var evo_redirect: [max_catalog]?usize = @splat(null);
+var evo_changed: [max_catalog]bool = @splat(false);
+
+/// Recompute every pet's form from its level. Returns true when any pet's
+/// look changed (it also marks which in `evo_changed`).
+fn refreshEvolution(model: *const Model) bool {
+    var any = false;
+    for (catalog_mod.catalog[0..catalog_mod.catalog_len], 0..) |*entry, i| {
+        const slug = entry.slice();
+        const level = model.xp.progressOf(slug).level;
+        var tint: evolution.Tint = .none;
+        var redirect: ?usize = null;
+        if (evolution.inTraditionalTree(slug)) {
+            if (evolution.traditionalForm(slug, level)) |form| redirect = catalog_mod.catalogIndexOf(form);
+        } else {
+            tint = evolution.tintFor(evolution.stageFor(level));
+        }
+        if (tint != evo_tint[i] or redirect != evo_redirect[i]) {
+            evo_tint[i] = tint;
+            evo_redirect[i] = redirect;
+            evo_changed[i] = true;
+            any = true;
+        }
+    }
+    return any;
+}
+
+/// Rebuild whatever shows a pet whose form changed: its thumbnail, the
+/// main sprite if it is the active pet, and any Agent-Pet animation row.
+fn applyEvolution(model: *Model, fx: *Effects) void {
+    for (0..catalog_mod.catalog_len) |i| {
+        if (!evo_changed[i]) continue;
+        evo_changed[i] = false;
+        if (thumbs_pixels.len > 0 and i < thumbs_built) buildThumbAt(fx, i);
+        for (0..agent_rail.pet_slots) |slot| {
+            if (agentPetCatalogIndex(model, slot) == i) agent_anim_built_len[slot] = 0;
+        }
+        if (model.sheet_loaded and model.active_pet == i) {
+            if (loadSheetForPet(fx, &catalog[i])) {
+                registerStateFrames(model.state, fx);
+                registerFlockFrames(fx);
+            }
+        }
+    }
+    model.agent_anim_rev +%= 1;
+}
+
 fn decodeSheet(fx: *Effects, entry: *const CatalogEntry) ?Sheet {
+    const index = catalog_mod.catalogIndexOf(entry.slice());
+    const shown: *const CatalogEntry = if (index) |i| (if (evo_redirect[i]) |r| &catalog[r] else entry) else entry;
+    const out = decodeSheetRaw(fx, shown) orelse return null;
+    if (index) |i| evolution.applyTint(out.pixels, evo_tint[i]);
+    return out;
+}
+
+fn decodeSheetRaw(fx: *Effects, entry: *const CatalogEntry) ?Sheet {
     const services = fx.services orelse return null;
     const file_buf = boot_allocator.alloc(u8, max_sheet_file_bytes) catch return null;
     defer boot_allocator.free(file_buf);
@@ -1948,6 +2008,10 @@ fn buildNextThumb(fx: *Effects) void {
     if (thumbs_built >= catalog_mod.catalog_len) return;
     const index = thumbs_built;
     thumbs_built += 1;
+    buildThumbAt(fx, index);
+}
+
+fn buildThumbAt(fx: *Effects, index: usize) void {
     if (thumbs_pixels.len == 0) {
         thumbs_pixels = boot_allocator.alloc(u8, max_catalog * thumb_w * thumb_h * 4) catch return;
         @memset(thumbs_pixels, 0);
@@ -2508,6 +2572,8 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.agent_pets = initial_agent_pets;
     model.agent_pet_px = initial_agent_pet_px;
     if (env_home) |home| model.xp = xp_mod.load(boot_allocator, home);
+    _ = refreshEvolution(model);
+    evo_changed = @splat(false);
     model.agent_pet_name = initial_agent_pet_name;
     model.agent_pet_name_len = initial_agent_pet_name_len;
     model.rotate_pets = initial_rotate_pets;
@@ -3660,6 +3726,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = expireBubbles(model, now);
             _ = agent_rail.expire(&model.rail, now);
             awardXp(model, now);
+            if (refreshEvolution(model)) applyEvolution(model, fx);
             // The flourish reads this clock instead of the coarse anim one;
             // it only advances while one plays (plus one tick to clear it),
             // so an idle app is not redrawn.
@@ -7504,6 +7571,7 @@ test "empty stack does not activate an application" {
 }
 
 test {
+    _ = evolution;
     _ = xp_mod;
     _ = levelup_mod;
 }
@@ -7573,4 +7641,30 @@ test "a pet already used by one agent cannot be given to another" {
     // Re-picking its own pet is still allowed.
     update(&model, .{ .set_agent_pet = (0 << 16) | 1 }, &fx);
     try std.testing.expectEqualStrings("beta", model.agent_pet_name[0][0..model.agent_pet_name_len[0]]);
+}
+
+test "reaching an evolution level tints the pet and marks it changed" {
+    var model: Model = .{};
+    const saved_len = catalog_mod.catalog_len;
+    const saved = catalog_mod.catalog;
+    defer {
+        catalog_mod.catalog_len = saved_len;
+        catalog_mod.catalog = saved;
+        evo_tint = @splat(.none);
+        evo_redirect = @splat(null);
+        evo_changed = @splat(false);
+    }
+    @memcpy(catalog_mod.catalog[0].name[0..5], "alpha");
+    catalog_mod.catalog[0].len = 5;
+    catalog_mod.catalog_len = 1;
+    try std.testing.expect(!refreshEvolution(&model));
+    _ = model.xp.add("alpha", xp_mod.threshold(evolution.first_evolution_level));
+    try std.testing.expect(refreshEvolution(&model));
+    try std.testing.expectEqual(evolution.Tint.purple, evo_tint[0]);
+    try std.testing.expect(evo_changed[0]);
+    evo_changed[0] = false;
+    try std.testing.expect(!refreshEvolution(&model));
+    _ = model.xp.add("alpha", xp_mod.threshold(evolution.second_evolution_level));
+    try std.testing.expect(refreshEvolution(&model));
+    try std.testing.expectEqual(evolution.Tint.gold, evo_tint[0]);
 }

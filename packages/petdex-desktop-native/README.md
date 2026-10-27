@@ -214,3 +214,17 @@ ring of sparkles on the rail pet and the main pet.
 Settings is a Pokédex: red top and bottom, a holographic blue screen, and
 a party screen with the main pet on the left and each agent's pet stacked
 on the right.
+
+## Evolution
+
+Every pet is in an evolution tree. A pet that is in no traditional line
+follows the default tree: its own sprite tinted purple at level 5 and gold
+at level 12 (`first_evolution_level` / `second_evolution_level` in
+`src/evolution.zig`). Real evolution lines go in the `traditional` table in
+the same file (`from`, `to`, `level`, by pet slug); a pet in such a line
+swaps to the later species' sprite (no tint) once the level is reached and
+that pet is installed. Evolving rebuilds the pet's thumbnail, main sprite
+and Agent-Pet animation row.
+
+Ended threads: an agent's SessionEnd hook removes that thread from the tab
+and credits its pet 30 XP.

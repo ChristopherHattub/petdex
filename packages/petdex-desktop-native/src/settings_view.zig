@@ -35,6 +35,7 @@ const agent_hooks = @import("agent_hooks.zig");
 const agent_rail = @import("agent_rail.zig");
 const xp_mod = @import("xp.zig");
 const levelup = @import("levelup.zig");
+const evolution = @import("evolution.zig");
 const installer = @import("installer.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const settingsBackground = app.settingsBackground;
@@ -728,7 +729,9 @@ var xp_labels: [4][32]u8 = undefined;
 /// "Lv 7" for a pet, formatted into the buffer owned by `key`.
 fn levelLabel(model: *const Model, name: []const u8, key: usize) []const u8 {
     const p = model.xp.progressOf(name);
-    return std.fmt.bufPrint(&level_labels[key], "Lv {d}", .{p.level}) catch "Lv";
+    const stage = evolution.stageOf(name, p.level);
+    if (stage == 0) return std.fmt.bufPrint(&level_labels[key], "Lv {d}", .{p.level}) catch "Lv";
+    return std.fmt.bufPrint(&level_labels[key], "Lv {d} · Evo {d}", .{ p.level, stage }) catch "Lv";
 }
 
 /// A thin XP bar: dark track, gold fill proportional to the way to the

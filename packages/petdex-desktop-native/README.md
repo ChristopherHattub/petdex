@@ -200,3 +200,17 @@ Notes:
 - If a remote account also runs a petdex desktop, do not point a remote at it:
   the writeback replaces that account's `~/.petdex/bin/petdex-hook` with the
   sh script.
+
+## Pet XP and levels
+
+Every pet earns XP without a level cap. An agent's pet gets +10 XP per
+finished cycle (red or yellow, then green), +15 when a thread that
+completed a cycle leaves the tab, and +1 per minute the agent works. The
+main pet earns from every agent (once, if it is also that agent's pet).
+Going from level L to L+1 takes `40 + 20·L` XP (60, 80, 100, ...). Totals
+live in `~/.petdex/pet-xp.json`. A level-up plays a hop, a gold flash and a
+ring of sparkles on the rail pet and the main pet.
+
+Settings is a Pokédex: red top and bottom, a holographic blue screen, and
+a party screen with the main pet on the left and each agent's pet stacked
+on the right.

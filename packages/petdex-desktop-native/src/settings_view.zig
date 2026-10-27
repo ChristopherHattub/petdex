@@ -33,6 +33,8 @@ const catalog_len = &catalog_mod.catalog_len;
 const max_catalog = catalog_mod.max_catalog;
 const agent_hooks = @import("agent_hooks.zig");
 const agent_rail = @import("agent_rail.zig");
+const xp_mod = @import("xp.zig");
+const levelup = @import("levelup.zig");
 const installer = @import("installer.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const settingsBackground = app.settingsBackground;
@@ -590,16 +592,19 @@ fn petsTop(ui: *AppUi, model: *const Model, filter: []const u8) AppUi.Node {
 
 // ------------------------------------------------------------- Pokedex look
 //
-// The settings window is a handheld dex: a red shell, a blue lens and
-// three LEDs up top, and every panel an LCD with phosphor-green text.
-// `dexify` restyles the finished tree instead of every call site.
+// The settings window is a handheld dex: a red shell top and bottom with
+// the blue lens and LEDs, and a holographic blue screen in between where
+// every panel is a translucent cyan card. `dexify` restyles the finished
+// tree instead of every call site.
 
 const Color = canvas.Color;
-const dex_text = Color.rgb8(176, 248, 200);
-const dex_muted = Color.rgb8(108, 178, 140);
-const dex_lcd_edge = Color.rgb8(5, 20, 16);
+const dex_text = Color.rgb8(236, 249, 255);
+const dex_muted = Color.rgb8(150, 204, 240);
+const dex_lcd_edge = Color.rgb8(6, 22, 48);
+const dex_cyan = Color.rgb8(112, 224, 255);
 const dex_lens = Color.rgb8(48, 138, 238);
-const dex_selected = Color.rgb8(30, 92, 66);
+const dex_selected = Color.rgba8(120, 230, 255, 96);
+const dex_gold = Color.rgb8(255, 214, 64);
 
 pub fn dexShell(model: *const Model) Color {
     return if (model.dark) Color.rgb8(104, 14, 26) else Color.rgb8(192, 28, 46);
@@ -609,17 +614,22 @@ fn dexShellDark(model: *const Model) Color {
     return if (model.dark) Color.rgb8(70, 8, 18) else Color.rgb8(140, 18, 34);
 }
 
-fn dexLcd(model: *const Model) Color {
-    return if (model.dark) Color.rgb8(13, 36, 30) else Color.rgb8(20, 48, 40);
+/// The translucent holographic screen between the red halves.
+fn dexHolo(model: *const Model) Color {
+    return if (model.dark) Color.rgb8(9, 42, 90) else Color.rgb8(22, 84, 164);
+}
+
+fn dexCard(model: *const Model) Color {
+    return if (model.dark) Color.rgba8(120, 220, 255, 30) else Color.rgba8(150, 230, 255, 40);
 }
 
 fn dexify(model: *const Model, node: *AppUi.Node) void {
     switch (node.widget.kind) {
         .panel, .list_item => if (node.style_tokens.background) |ref| {
             if (ref == .surface) {
-                node.widget.style.background = dexLcd(model);
-                node.widget.style.border = dex_lcd_edge;
-                node.widget.style.stroke_width = 2;
+                node.widget.style.background = dexCard(model);
+                node.widget.style.border = dex_cyan;
+                node.widget.style.stroke_width = 1.5;
             }
         },
         .text => {
@@ -674,6 +684,67 @@ fn dexTopBar(ui: *AppUi, model: *const Model) AppUi.Node {
     return bar;
 }
 
+/// The dex's lower half: a round button, two pill buttons, the speaker
+/// slits and a one-line legend for the levels.
+fn dexBottomBar(ui: *AppUi, model: *const Model) AppUi.Node {
+    var round = ui.el(.panel, .{ .width = 26, .height = 26 }, .{});
+    round.widget.style.radius = 13;
+    round.widget.style.background = Color.rgb8(34, 38, 48);
+    round.widget.style.border = dex_lcd_edge;
+    round.widget.style.stroke_width = 2;
+    var pill_a = ui.el(.panel, .{ .width = 30, .height = 9 }, .{});
+    pill_a.widget.style.radius = 4.5;
+    pill_a.widget.style.background = Color.rgb8(250, 204, 21);
+    pill_a.widget.style.border = dex_lcd_edge;
+    pill_a.widget.style.stroke_width = 1.5;
+    var pill_b = ui.el(.panel, .{ .width = 30, .height = 9 }, .{});
+    pill_b.widget.style.radius = 4.5;
+    pill_b.widget.style.background = dex_lens;
+    pill_b.widget.style.border = dex_lcd_edge;
+    pill_b.widget.style.stroke_width = 1.5;
+    var slits: [3]AppUi.Node = undefined;
+    for (&slits) |*slit| {
+        slit.* = ui.el(.panel, .{ .width = 3, .height = 20 }, .{});
+        slit.widget.style.radius = 1.5;
+        slit.widget.style.background = dexShellDark(model);
+    }
+    var legend = ui.text(.{ .size = .sm }, "Lv rises with every finished cycle");
+    legend.widget.style.foreground = Color.rgb8(255, 214, 220);
+    var bar = ui.row(.{ .height = 46, .padding = 10, .gap = 10, .cross = .center }, .{
+        round,
+        ui.column(.{ .gap = 5 }, .{ pill_a, pill_b }),
+        ui.el(.stack, .{ .grow = 1 }, .{}),
+        legend,
+        ui.row(.{ .gap = 4, .cross = .center }, @as([]const AppUi.Node, &slits)),
+    });
+    bar.widget.style.background = dexShellDark(model);
+    return bar;
+}
+
+var level_labels: [max_catalog + 4][24]u8 = undefined;
+var xp_labels: [4][32]u8 = undefined;
+
+/// "Lv 7" for a pet, formatted into the buffer owned by `key`.
+fn levelLabel(model: *const Model, name: []const u8, key: usize) []const u8 {
+    const p = model.xp.progressOf(name);
+    return std.fmt.bufPrint(&level_labels[key], "Lv {d}", .{p.level}) catch "Lv";
+}
+
+/// A thin XP bar: dark track, gold fill proportional to the way to the
+/// next level.
+fn xpBar(ui: *AppUi, model: *const Model, name: []const u8, w: f32) AppUi.Node {
+    const fraction = std.math.clamp(model.xp.progressOf(name).fraction(), 0, 1);
+    var fill = ui.el(.panel, .{ .width = @max(3, w * fraction), .height = 6, .padding = 0 }, .{});
+    fill.widget.style.radius = 3;
+    fill.widget.style.background = dex_gold;
+    var track = ui.el(.panel, .{ .width = w, .height = 6, .padding = 0 }, .{fill});
+    track.widget.style.radius = 3;
+    track.widget.style.background = Color.rgba8(0, 12, 30, 150);
+    track.widget.style.border = Color.rgba8(112, 224, 255, 120);
+    track.widget.style.stroke_width = 1;
+    return track;
+}
+
 const dex_cols: usize = 3;
 const dex_max_rows: usize = max_catalog / dex_cols + 1;
 const dex_visible: usize = 9;
@@ -706,7 +777,7 @@ fn dexGrid(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, filter: []const 
         const number = std.fmt.bufPrint(&dex_labels[i], "No. {d:0>3}", .{i + 1}) catch "No.";
         var card = ui.el(.list_item, .{
             .grow = 1,
-            .height = if (deletable) 150 else 124,
+            .height = if (deletable) 176 else 150,
             .padding = 8,
             .main = .center,
             .cross = .center,
@@ -718,6 +789,8 @@ fn dexGrid(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, filter: []const 
                 ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, number),
                 thumbImage(ui, thumbs, i, entry.slice(), 64, 70),
                 ui.text(.{ .size = .sm }, entry.slice()),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, levelLabel(model, entry.slice(), i)),
+                xpBar(ui, model, entry.slice(), 64),
                 if (deletable)
                     ui.button(.{ .size = .sm, .width = 32, .variant = .secondary, .on_press = Msg{ .ask_delete_pet = @intCast(i) } }, "X")
                 else
@@ -727,8 +800,8 @@ fn dexGrid(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, filter: []const 
         if (current != null and current.? == i) {
             card.style_tokens.background = null;
             card.widget.style.background = dex_selected;
-            card.widget.style.border = dex_text;
-            card.widget.style.stroke_width = 2;
+            card.widget.style.border = dex_gold;
+            card.widget.style.stroke_width = 2.5;
         }
         cards[grid.shown] = card;
         grid.shown += 1;
@@ -786,47 +859,120 @@ fn collapsible(ui: *AppUi, model: *const Model, section: app.Section, title: []c
 const agent_pet_labels = [_][]const u8{ "Claude Code", "Antigravity", "Codex" };
 const agent_pet_hooks = [_][]const u8{ "claude-code", "gemini", "codex" };
 
-/// One mini portrait: the pet inside its status ring with the agent logo
-/// in the corner, exactly as the tab draws it. Pressing it opens the
-/// collection to choose from; the slider below resizes it.
-fn agentPetCard(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, slot: usize, on_size: @TypeOf(AppUi.valueMsg(.set_scale))) AppUi.Node {
-    const px = std.math.clamp(model.agent_pet_px[slot], agent_rail.min_pet_px, agent_rail.max_pet_px);
+fn railIcons(icons: IconAtlas) agent_rail.IconAtlas {
+    return .{ .ready = icons.ready, .image = icons.image, .rect = icons.rect, .index = &app.agentIconIndex };
+}
+
+fn railThumbs(thumbs: ThumbAtlas) agent_rail.ThumbAtlas {
+    return .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h, .anim_image = thumbs.anim_image, .anim_ready = thumbs.anim_ready };
+}
+
+const party_row_h: f32 = 68;
+const party_gap: f32 = 8;
+var party_no_buf: [16]u8 = undefined;
+
+/// The big left slot of the party screen: the main pet, with its number,
+/// level and XP bar. Pressing it opens the collection.
+fn partyMain(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, h: f32) AppUi.Node {
+    const have = model.active_pet < catalog_mod.catalog_len;
+    const name: []const u8 = if (have) catalog[model.active_pet].slice() else "No pet selected";
+    const portrait = if (have)
+        thumbImage(ui, thumbs, model.active_pet, name, 104, 112)
+    else
+        ui.el(.stack, .{ .width = 104, .height = 112 }, .{});
+    var card = ui.el(.list_item, .{
+        .grow = 1,
+        .height = h,
+        .padding = 10,
+        .main = .center,
+        .cross = .center,
+        .on_press = .toggle_pet_picker,
+        .style_tokens = .{ .background = .surface, .radius = .md },
+        .semantics = .{ .label = "Change main pet" },
+    }, .{
+        ui.column(.{ .gap = 4, .cross = .center }, .{
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "MAIN PET"),
+            portrait,
+            ui.text(.{}, name),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (have) (std.fmt.bufPrint(&party_no_buf, "No. {d:0>3}", .{model.active_pet + 1}) catch "No.") else ""),
+            if (have) ui.text(.{ .size = .sm }, levelLabel(model, name, max_catalog + 3)) else ui.el(.stack, .{}, .{}),
+            if (have) xpBar(ui, model, name, 120) else ui.el(.stack, .{}, .{}),
+        }),
+    });
+    card.widget.style.border = dex_gold;
+    return card;
+}
+
+/// One stacked blue row of the party screen: an agent's pet in its ring,
+/// the agent, the pet's name and level, and its XP bar.
+fn partyRow(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, slot: usize) AppUi.Node {
+    const px: f32 = 40;
     const index = app.agentPetCatalogIndex(model, slot);
     const name: []const u8 = if (index) |i| catalog[i].slice() else "No pet";
-    const preview: AppUi.Node = if (index) |i|
-        agent_rail.ringedPet(ui, agent_pet_hooks[slot], .idle, agent_pet_labels[slot], px, slot, i, model.rail.anim_ms, .{
-            .ready = icons.ready,
-            .image = icons.image,
-            .rect = icons.rect,
-            .index = &app.agentIconIndex,
-        }, .{ .image = thumbs.image, .ready = thumbs.ready, .cell_w = thumbs.cell_w, .cell_h = thumbs.cell_h, .anim_image = thumbs.anim_image, .anim_ready = thumbs.anim_ready }, null)
+    const flourish = levelup.progress(model.rail.now_ms, model.levelup_at_ms[slot]);
+    const portrait: AppUi.Node = if (index) |i|
+        agent_rail.ringedPet(ui, agent_pet_hooks[slot], .idle, agent_pet_labels[slot], px, slot, i, model.rail.anim_ms, railIcons(icons), railThumbs(thumbs), null, flourish)
     else
         ui.el(.stack, .{ .width = px, .height = px }, .{});
-    const fraction: f32 = (px - agent_rail.min_pet_px) / (agent_rail.max_pet_px - agent_rail.min_pet_px);
-    return ui.column(.{ .grow = 1, .gap = 6, .cross = .center }, .{
-        ui.el(.list_item, .{
-            .width = agent_rail.max_pet_px + 24,
-            .height = agent_rail.max_pet_px + 24,
-            .padding = 6,
-            .main = .center,
-            .cross = .center,
-            .on_press = Msg{ .open_agent_pet_picker = @intCast(slot) },
-            .style_tokens = .{ .background = .surface, .radius = .md },
-            .semantics = .{ .label = name },
-        }, .{preview}),
-        ui.text(.{ .size = .sm }, agent_pet_labels[slot]),
-        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, name),
-        ui.el(.slider, .{ .width = 110, .value = fraction, .on_value = on_size, .semantics = .{ .label = agent_pet_labels[slot] } }, .{}),
+    return ui.el(.list_item, .{
+        .height = party_row_h,
+        .padding = 8,
+        .gap = 10,
+        .cross = .center,
+        .on_press = Msg{ .open_agent_pet_picker = @intCast(slot) },
+        .style_tokens = .{ .background = .surface, .radius = .md },
+        .semantics = .{ .label = agent_pet_labels[slot] },
+    }, .{
+        portrait,
+        ui.column(.{ .grow = 1, .gap = 2 }, .{
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, agent_pet_labels[slot]),
+            ui.row(.{ .gap = 8, .cross = .center }, .{
+                ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .sm }, name)}),
+                ui.text(.{ .size = .sm }, if (index != null) levelLabel(model, name, max_catalog + slot) else ""),
+            }),
+            xpBar(ui, model, name, 150),
+        }),
+    });
+}
+
+/// "Choose a team": the main pet on the left, each agent's pet stacked on
+/// the right.
+fn partyScreen(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
+    const total_h = party_row_h * 3 + party_gap * 2;
+    if (!model.agent_pets) {
+        return ui.column(.{ .gap = 8 }, .{
+            partyMain(ui, model, thumbs, 200),
+            mutedParagraph(ui, "Press the pet to switch it. Turn on Agent-Pets in Appearance to give each agent its own"),
+        });
+    }
+    return ui.column(.{ .gap = 8 }, .{
+        ui.row(.{ .gap = party_gap }, .{
+            partyMain(ui, model, thumbs, total_h),
+            ui.column(.{ .grow = 1, .gap = party_gap }, .{
+                partyRow(ui, model, icons, thumbs, 0),
+                partyRow(ui, model, icons, thumbs, 1),
+                partyRow(ui, model, icons, thumbs, 2),
+            }),
+        }),
+        mutedParagraph(ui, "Pick a slot to choose its pet. Pets earn XP while their agent works and finishes threads; the main pet earns from all of them"),
+    });
+}
+
+fn cancelRow(ui: *AppUi, on_press: Msg) AppUi.Node {
+    return ui.row(.{ .gap = 8 }, .{
+        ui.el(.stack, .{ .grow = 1 }, .{}),
+        ui.button(.{ .size = .sm, .variant = .secondary, .on_press = on_press }, "Cancel"),
     });
 }
 
 fn agentPetPicker(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, slot: usize) AppUi.Node {
     const grid = dexGrid(ui, model, thumbs, model.pet_filter[0..model.pet_filter_len], slot);
+    var heading_buf: [48]u8 = undefined;
+    const heading = std.fmt.bufPrint(&heading_buf, "Choose a pet for {s}", .{agent_pet_labels[slot]}) catch agent_pet_labels[slot];
     return ui.column(.{ .gap = 8 }, .{
         ui.row(.{ .gap = 6, .cross = .center }, .{
-            ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .lg }, agent_pet_labels[slot])}),
+            ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .lg }, heading)}),
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = Msg{ .reset_agent_pet = @intCast(slot) } }, "Same as main pet"),
-            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .close_agent_pet_picker }, "Back"),
         }),
         ui.el(.search_field, .{
             .height = 34,
@@ -837,18 +983,27 @@ fn agentPetPicker(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, slot: usi
         }, .{}),
         ui.column(.{ .gap = 8 }, @as([]const AppUi.Node, grid.rows[0..grid.row_count])),
         dexMore(ui, &grid),
+        cancelRow(ui, .close_agent_pet_picker),
     });
 }
 
-fn agentPetsSection(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas) AppUi.Node {
-    if (model.agent_pet_picker != 0) return agentPetPicker(ui, model, thumbs, model.agent_pet_picker - 1);
-    return ui.column(.{ .gap = 8 }, .{
-        ui.row(.{ .gap = 8, .cross = .start }, .{
-            agentPetCard(ui, model, icons, thumbs, 0, AppUi.valueMsg(.set_agent_pet_size_claude)),
-            agentPetCard(ui, model, icons, thumbs, 1, AppUi.valueMsg(.set_agent_pet_size_gemini)),
-            agentPetCard(ui, model, icons, thumbs, 2, AppUi.valueMsg(.set_agent_pet_size_codex)),
+fn sizeRow(ui: *AppUi, model: *const Model, slot: usize, on_size: @TypeOf(AppUi.valueMsg(.set_scale))) AppUi.Node {
+    const px = std.math.clamp(model.agent_pet_px[slot], agent_rail.min_pet_px, agent_rail.max_pet_px);
+    const fraction: f32 = (px - agent_rail.min_pet_px) / (agent_rail.max_pet_px - agent_rail.min_pet_px);
+    return ui.row(.{ .gap = 12, .cross = .center }, .{
+        ui.column(.{ .grow = 1 }, .{ui.text(.{ .size = .sm }, agent_pet_labels[slot])}),
+        ui.el(.slider, .{ .width = 170, .value = fraction, .on_value = on_size, .semantics = .{ .label = agent_pet_labels[slot] } }, .{}),
+    });
+}
+
+fn agentPetsSection(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+        ui.column(.{ .padding = 12, .gap = 10 }, .{
+            mutedParagraph(ui, "Size of each agent's mini pet in the tab"),
+            sizeRow(ui, model, 0, AppUi.valueMsg(.set_agent_pet_size_claude)),
+            sizeRow(ui, model, 1, AppUi.valueMsg(.set_agent_pet_size_gemini)),
+            sizeRow(ui, model, 2, AppUi.valueMsg(.set_agent_pet_size_codex)),
         }),
-        mutedParagraph(ui, "Click a portrait to choose that agent's pet from your collection; drag its slider to resize it"),
     });
 }
 
@@ -899,15 +1054,20 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
     var page = ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{ui.column(.{ .padding = 12, .gap = 10 }, .{
         collapsible(ui, model, .pet, "Pet", ui.column(.{ .gap = 10 }, .{
             cloudLibrarySection(ui, model, cloud_images),
-            if (model.pet_picker_open) petsTop(ui, model, filter) else petPortrait(ui, model, thumbs),
-            if (model.pet_picker_open) deleteConfirm(ui, model) else ui.el(.stack, .{}, .{}),
-            if (!model.pet_picker_open)
+            if (model.agent_pet_picker != 0)
+                agentPetPicker(ui, model, thumbs, model.agent_pet_picker - 1)
+            else if (model.pet_picker_open)
+                petsTop(ui, model, filter)
+            else
+                partyScreen(ui, model, icons, thumbs),
+            if (model.pet_picker_open and model.agent_pet_picker == 0) deleteConfirm(ui, model) else ui.el(.stack, .{}, .{}),
+            if (!model.pet_picker_open or model.agent_pet_picker != 0)
                 ui.el(.stack, .{}, .{})
             else if (model.pet_source == .installed)
                 ui.column(.{ .gap = 8 }, @as([]const AppUi.Node, grid.rows[0..grid.row_count]))
             else
                 ui.column(.{ .gap = 6 }, @as([]const AppUi.Node, rows[0..shown])),
-            if (!model.pet_picker_open)
+            if (!model.pet_picker_open or model.agent_pet_picker != 0)
                 ui.el(.stack, .{}, .{})
             else if (model.pet_source == .installed)
                 dexMore(ui, &grid)
@@ -917,9 +1077,10 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
                 ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "No pets match your search")
             else
                 ui.el(.stack, .{}, .{}),
+            if (model.pet_picker_open and model.agent_pet_picker == 0) cancelRow(ui, .toggle_pet_picker) else ui.el(.stack, .{}, .{}),
         })),
         if (model.agent_pets)
-            collapsible(ui, model, .agent_pets, "Agent-Pets", agentPetsSection(ui, model, icons, thumbs))
+            collapsible(ui, model, .agent_pets, "Agent-Pet size", agentPetsSection(ui, model))
         else
             ui.el(.stack, .{}, .{}),
         collapsible(ui, model, .agents, "Agents", ui.column(.{ .gap = 10 }, .{
@@ -1120,10 +1281,16 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.el(.stack, .{ .height = 8 }, .{}),
     })});
     dexify(model, &page);
-    const content = ui.column(.{ .grow = 1 }, .{
+    var screen = ui.el(.panel, .{ .grow = 1, .padding = 0 }, .{page});
+    screen.widget.style.background = dexHolo(model);
+    screen.widget.style.border = dex_cyan;
+    screen.widget.style.stroke_width = 2;
+    screen.widget.style.radius = 10;
+    const content = ui.column(.{ .grow = 1, .gap = 0 }, .{
         ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
         dexTopBar(ui, model),
-        page,
+        ui.column(.{ .grow = 1, .padding = 8 }, .{screen}),
+        dexBottomBar(ui, model),
     });
     var root = ui.panel(.{ .grow = 1 }, .{content});
     root.widget.style.background = dexShell(model);
@@ -1194,4 +1361,17 @@ test "settings sections fold away until their header is pressed" {
     model.sections_open |= 1 << @intFromEnum(app.Section.appearance);
     const opened = collapsible(&ui, &model, .appearance, "Appearance", body);
     try std.testing.expectEqualStrings("body", opened.nodes[1].widget.text);
+}
+
+test "party screen shows a level and an XP bar for every slot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    var model: Model = .{};
+    _ = model.xp.add("boba", 100);
+    const bar = xpBar(&ui, &model, "boba", 100);
+    // Level 2 needs 80; 40 into it is half-way.
+    try std.testing.expectEqual(@as(f32, 50), bar.nodes[0].widget.layout.min_size.width);
+    try std.testing.expectEqualStrings("Lv 2", levelLabel(&model, "boba", 0));
+    try std.testing.expectEqualStrings("Lv 1", levelLabel(&model, "ghost-ai", 1));
 }

@@ -33,6 +33,8 @@ const sdk_log = @import("sdk_log.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 const agent_rail = @import("agent_rail.zig");
+const xp_mod = @import("xp.zig");
+const levelup_mod = @import("levelup.zig");
 const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
@@ -205,7 +207,67 @@ pub fn agentPetCatalogIndex(model: *const Model, slot: usize) ?usize {
     return null;
 }
 
+/// How long the level-up flourish plays on a pet.
+pub const levelup_ms: i64 = levelup_mod.duration_ms;
+
+/// Credit XP to the pets that earned it. Agent rows feed their own pet and
+/// the main pet; if both are the same pet it is paid once.
+fn awardXp(model: *Model, now: i64) void {
+    const dt: i64 = if (model.xp_last_ms > 0) std.math.clamp(now - model.xp_last_ms, 0, 5000) else 0;
+    model.xp_last_ms = now;
+    var main_total: u64 = 0;
+    var gained = false;
+    for (0..agent_rail.pet_slots + 1) |slot| {
+        var amount: u64 = @as(u64, model.rail.earned_cycles[slot]) * xp_mod.cycle_xp +
+            @as(u64, model.rail.earned_threads[slot]) * xp_mod.thread_xp;
+        model.rail.earned_cycles[slot] = 0;
+        model.rail.earned_threads[slot] = 0;
+        if (slot < agent_rail.pet_slots) {
+            for (model.rail.entries[0..model.rail.len]) |*entry| {
+                if (entry.status == .working and agent_rail.petSlot(entry.agentSlice()) == slot) {
+                    model.xp_work_ms[slot] += dt;
+                    break;
+                }
+            }
+            while (model.xp_work_ms[slot] >= 60_000) {
+                model.xp_work_ms[slot] -= 60_000;
+                amount += xp_mod.minute_xp;
+            }
+        }
+        if (amount == 0) continue;
+        gained = true;
+        main_total += amount;
+        if (slot >= agent_rail.pet_slots) continue;
+        const index = agentPetCatalogIndex(model, slot) orelse continue;
+        const name = catalog_mod.catalog[index].slice();
+        if (std.mem.eql(u8, name, model.pet_name[0..model.pet_name_len])) continue;
+        if (model.xp.add(name, amount) != null) model.levelup_at_ms[slot] = now;
+    }
+    if (main_total > 0 and model.pet_name_len > 0) {
+        if (model.xp.add(model.pet_name[0..model.pet_name_len], main_total) != null) model.main_levelup_at_ms = now;
+    }
+    if (gained) if (env_home) |home| {
+        _ = xp_mod.save(boot_allocator, home, &model.xp);
+    };
+}
+
+fn flourishLive(model: *const Model, now: i64) bool {
+    if (levelup_mod.active(now, model.main_levelup_at_ms)) return true;
+    for (model.levelup_at_ms) |at| {
+        if (levelup_mod.active(now, at)) return true;
+    }
+    return false;
+}
+
 pub const Model = struct {
+    xp: xp_mod.Store = .{},
+    xp_work_ms: [agent_rail.pet_slots]i64 = @splat(0),
+    xp_last_ms: i64 = 0,
+    /// When each Agent-Pet, and the main pet, last levelled up.
+    levelup_at_ms: [agent_rail.pet_slots]i64 = @splat(-levelup_ms),
+    main_levelup_at_ms: i64 = -levelup_ms,
+    /// Clock the level-up flourish reads; see the poll tick.
+    fx_now_ms: i64 = 0,
     sheet_loaded: bool = false,
     pet_name: [64]u8 = @splat(0),
     pet_name_len: usize = 0,
@@ -2422,6 +2484,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.hide_dock = initial_hide_dock;
     model.agent_pets = initial_agent_pets;
     model.agent_pet_px = initial_agent_pet_px;
+    if (env_home) |home| model.xp = xp_mod.load(boot_allocator, home);
     model.agent_pet_name = initial_agent_pet_name;
     model.agent_pet_name_len = initial_agent_pet_name_len;
     model.rotate_pets = initial_rotate_pets;
@@ -3180,6 +3243,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_agent_pet_picker => |slot| {
             if (slot >= agent_rail.pet_slots) return;
             model.agent_pet_picker = if (model.agent_pet_picker == slot + 1) 0 else slot + 1;
+            model.sections_open |= 1 << @intFromEnum(Section.pet);
         },
         .close_agent_pet_picker => model.agent_pet_picker = 0,
         .set_agent_pet => |packed_choice| {
@@ -3496,7 +3560,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 buildAgentAnim(model, fx);
             }
             const now = fx.wallMs();
-            if (model.agent_pets) model.rail.anim_ms = @divTrunc(now, anim_tick_ms) * anim_tick_ms;
+            // An all-idle rail holds still, so its clock stays put: a model
+            // that never changes does not repaint the settings window under
+            // a click.
+            if (model.agent_pets and agent_rail.animating(&model.rail)) model.rail.anim_ms = @divTrunc(now, anim_tick_ms) * anim_tick_ms;
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
@@ -3555,6 +3622,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             _ = expireBubbles(model, now);
             _ = agent_rail.expire(&model.rail, now);
+            awardXp(model, now);
+            // The flourish reads this clock instead of the coarse anim one;
+            // it only advances while one plays (plus one tick to clear it),
+            // so an idle app is not redrawn.
+            if (flourishLive(model, model.fx_now_ms) or flourishLive(model, now)) {
+                model.fx_now_ms = now;
+                model.rail.now_ms = now;
+            }
             // A newly drained bubble is declared as a popup in the same
             // update pass. Compute Linux's side after expiry and before
             // that declaration so the first rendered frame uses the same
@@ -4803,6 +4878,18 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     node.widget.image_fit = .stretch;
     node.widget.image_sampling = .nearest;
+    var shown = node;
+    if (levelup_mod.progress(model.fx_now_ms, model.main_levelup_at_ms)) |t| {
+        // Hop and sparkle inside a panel exactly the sprite's size, so the
+        // window and its layout do not change for the flourish.
+        node.widget.frame.y = levelup_mod.hop(t, h);
+        var stars: [levelup_mod.sparkle_count]AppUi.Node = undefined;
+        const lit = levelup_mod.sparkles(ui, @min(w, h), 0, t, &stars);
+        var kids: [1 + levelup_mod.sparkle_count]AppUi.Node = undefined;
+        kids[0] = node;
+        @memcpy(kids[1..][0..lit.len], lit);
+        shown = ui.el(.panel, .{ .width = w, .height = h, .padding = 0 }, @as([]const AppUi.Node, kids[0 .. 1 + lit.len]));
+    }
     // Linux hands primary presses to the compositor through GTK/GDK;
     // secondary presses still follow the canvas context-menu route.
     if (builtin.target.os.tag == .linux) {
@@ -4811,13 +4898,13 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         // hit route before mounting the canvas fallback menu.
         node.context_menu = &pet_menu;
         return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = &pet_menu }, .{
-            node,
+            shown,
             ui.el(.stack, .{ .width = 1, .height = pet_edge_pad }, .{}),
         });
     }
     // Win/mac keep the upstream sprite-only root and app-owned drag path;
     // their bubble is a separate companion window.
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{node});
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{shown});
 }
 
 // ----------------------------------------------------------- bubble
@@ -5192,6 +5279,7 @@ fn syncRailWindow(model: *Model, fx: *Effects) void {
     for (0..agent_rail.pet_slots) |slot| {
         model.rail.pet_px[slot] = model.agent_pet_px[slot];
         model.rail.pet_thumb[slot] = agentPetCatalogIndex(model, slot);
+        model.rail.levelup_at_ms[slot] = model.levelup_at_ms[slot];
     }
     agent_rail.sync(&model.rail, fx, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
 }
@@ -7367,4 +7455,50 @@ test "empty stack does not activate an application" {
         }
     };
     try std.testing.expect(!focusNewestBubble(&model, Focus.activate));
+}
+
+test {
+    _ = xp_mod;
+    _ = levelup_mod;
+}
+
+test "finished cycles and minutes of work feed the agent pet and the main pet" {
+    var model: Model = .{};
+    @memcpy(model.pet_name[0..4], "boba");
+    model.pet_name_len = 4;
+    model.rail.earned_cycles[0] = 2;
+    model.rail.earned_threads[3] = 1;
+    awardXp(&model, 1000);
+    // Slot 0's pet is the active pet here, so the main pet is paid once:
+    // 2 cycles + 1 thread from an agent without a pet row.
+    try std.testing.expectEqual(@as(u64, 2 * xp_mod.cycle_xp + xp_mod.thread_xp), model.xp.xpOf("boba"));
+    try std.testing.expectEqual(@as(i64, -levelup_ms), model.levelup_at_ms[0]);
+    model.rail.earned_cycles[3] = 4;
+    awardXp(&model, 2000);
+    try std.testing.expectEqual(@as(i64, 2000), model.main_levelup_at_ms);
+}
+
+test "choosing a pet for one agent leaves the other slots alone" {
+    var model: Model = .{};
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    const saved_len = catalog_mod.catalog_len;
+    const saved = catalog_mod.catalog;
+    defer {
+        catalog_mod.catalog_len = saved_len;
+        catalog_mod.catalog = saved;
+    }
+    const names = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (names, 0..) |name, i| {
+        @memcpy(catalog_mod.catalog[i].name[0..name.len], name);
+        catalog_mod.catalog[i].len = name.len;
+    }
+    catalog_mod.catalog_len = 3;
+    update(&model, .{ .set_agent_pet = (2 << 16) | 1 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.agent_pet_name_len[0]);
+    try std.testing.expectEqual(@as(u8, 0), model.agent_pet_name_len[1]);
+    try std.testing.expectEqualStrings("beta", model.agent_pet_name[2][0..model.agent_pet_name_len[2]]);
+    update(&model, .{ .set_agent_pet = (0 << 16) | 2 }, &fx);
+    try std.testing.expectEqualStrings("gamma", model.agent_pet_name[0][0..model.agent_pet_name_len[0]]);
+    try std.testing.expectEqualStrings("beta", model.agent_pet_name[2][0..model.agent_pet_name_len[2]]);
 }

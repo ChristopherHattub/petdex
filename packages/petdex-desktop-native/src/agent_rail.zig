@@ -741,13 +741,20 @@ fn extensionFor(ui: *AppUi, model: *const Model, group: *const Group, icons: Ico
         const entry = &model.entries[member];
         minis[i] = ringedIcon(ui, entry.agentSlice(), entry.status, memberLabel(entry, member), mini_sizes, icons, focusMsg(model, member));
     }
+    // A panel places its children at their own frame offset, not by
+    // alignment, so the row is sized to its icons and centred by hand.
+    // Left to default it sat at the panel's top-left corner and the last
+    // icons ran past the edge.
+    const count: f32 = @floatFromInt(group.count);
+    const row_w = count * mini_cell_px + (count - 1) * mini_gap;
+    var icons_row = ui.row(.{ .width = row_w, .height = mini_cell_px, .gap = mini_gap, .cross = .center }, @as([]const AppUi.Node, minis[0..group.count]));
+    icons_row.widget.frame.x = (extWidth(group.count) - row_w) / 2;
+    icons_row.widget.frame.y = (ext_h - mini_cell_px) / 2;
     var panel = ui.el(.panel, .{
         .width = extWidth(group.count),
         .height = ext_h,
         .padding = 0,
-        .main = .center,
-        .cross = .center,
-    }, .{ui.row(.{ .gap = mini_gap, .cross = .center }, @as([]const AppUi.Node, minis[0..group.count]))});
+    }, .{icons_row});
     styleTab(&panel, ext_radius);
     return panel;
 }
@@ -1117,4 +1124,24 @@ test "idle agent pets hold a still frame" {
         if (animFrame(.working, ms) != animFrame(.working, 0)) moved = true;
     }
     try std.testing.expect(moved);
+}
+
+test "extension icons are centred inside their tab" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    const model = testModel(&.{
+        testBubble("a", "claude-code", .running),
+        testBubble("b", "claude-code", .running),
+        testBubble("c", "claude-code", .running),
+    });
+    const groups = groupsOf(&model);
+    const panel = extensionFor(&ui, &model, &groups.items[0], test_icons);
+    const row = panel.nodes[0];
+    const panel_w = panel.widget.layout.min_size.width;
+    const panel_h = panel.widget.layout.min_size.height;
+    const row_w = row.widget.layout.min_size.width;
+    try std.testing.expectEqual((panel_w - row_w) / 2, row.widget.frame.x);
+    try std.testing.expectEqual((panel_h - row.widget.layout.min_size.height) / 2, row.widget.frame.y);
+    try std.testing.expect(row.widget.frame.x + row_w <= panel_w);
 }

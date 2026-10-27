@@ -7477,3 +7477,28 @@ test "finished cycles and minutes of work feed the agent pet and the main pet" {
     awardXp(&model, 2000);
     try std.testing.expectEqual(@as(i64, 2000), model.main_levelup_at_ms);
 }
+
+test "choosing a pet for one agent leaves the other slots alone" {
+    var model: Model = .{};
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    const saved_len = catalog_mod.catalog_len;
+    const saved = catalog_mod.catalog;
+    defer {
+        catalog_mod.catalog_len = saved_len;
+        catalog_mod.catalog = saved;
+    }
+    const names = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (names, 0..) |name, i| {
+        @memcpy(catalog_mod.catalog[i].name[0..name.len], name);
+        catalog_mod.catalog[i].len = name.len;
+    }
+    catalog_mod.catalog_len = 3;
+    update(&model, .{ .set_agent_pet = (2 << 16) | 1 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.agent_pet_name_len[0]);
+    try std.testing.expectEqual(@as(u8, 0), model.agent_pet_name_len[1]);
+    try std.testing.expectEqualStrings("beta", model.agent_pet_name[2][0..model.agent_pet_name_len[2]]);
+    update(&model, .{ .set_agent_pet = (0 << 16) | 2 }, &fx);
+    try std.testing.expectEqualStrings("gamma", model.agent_pet_name[0][0..model.agent_pet_name_len[0]]);
+    try std.testing.expectEqualStrings("beta", model.agent_pet_name[2][0..model.agent_pet_name_len[2]]);
+}

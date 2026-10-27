@@ -3243,6 +3243,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_agent_pet_picker => |slot| {
             if (slot >= agent_rail.pet_slots) return;
             model.agent_pet_picker = if (model.agent_pet_picker == slot + 1) 0 else slot + 1;
+            model.sections_open |= 1 << @intFromEnum(Section.pet);
         },
         .close_agent_pet_picker => model.agent_pet_picker = 0,
         .set_agent_pet => |packed_choice| {
@@ -3559,7 +3560,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 buildAgentAnim(model, fx);
             }
             const now = fx.wallMs();
-            if (model.agent_pets) model.rail.anim_ms = @divTrunc(now, anim_tick_ms) * anim_tick_ms;
+            // An all-idle rail holds still, so its clock stays put: a model
+            // that never changes does not repaint the settings window under
+            // a click.
+            if (model.agent_pets and agent_rail.animating(&model.rail)) model.rail.anim_ms = @divTrunc(now, anim_tick_ms) * anim_tick_ms;
             _ = hook_server.mailbox.suppressStaleRunning(now, stale_running_grace_ms);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {

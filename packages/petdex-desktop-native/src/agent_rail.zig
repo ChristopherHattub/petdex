@@ -269,6 +269,15 @@ fn noteDone(model: *Model, entry: *Entry, to: Status) void {
     model.earned_cycles[slot] +|= 1;
 }
 
+/// True while some row's pet moves; idle pets hold frame 0, so the clock
+/// only needs to run (and redraw anything) when this is.
+pub fn animating(model: *const Model) bool {
+    for (model.entries[0..model.len]) |*entry| {
+        if (entry.status != .idle) return true;
+    }
+    return false;
+}
+
 fn indexOf(model: *const Model, identity: hook_server.BubbleIdentity) ?usize {
     for (model.entries[0..model.len], 0..) |*entry, index| {
         if (!entry.identity().matches(identity)) continue;

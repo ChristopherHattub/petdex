@@ -354,7 +354,7 @@ pub const Group = struct {
 };
 
 /// Rows that are always shown, in this order.
-const default_rows = [_][]const u8{ "claude-code", "gemini", "codex" };
+pub const default_rows = [_][]const u8{ "claude-code", "gemini", "codex" };
 pub const max_groups = max_entries + default_rows.len;
 
 pub const Groups = struct {
@@ -758,6 +758,17 @@ fn focusMsg(model: *const Model, index: ?usize) ?Msg {
     return Msg{ .focus_rail_session = @intCast(i) };
 }
 
+/// What pressing a row's main icon does: jump to its most urgent session,
+/// or, with none left to jump to (idle row, or a remote session), open the
+/// agent's app.
+fn groupPress(model: *const Model, group: *const Group) ?Msg {
+    if (focusMsg(model, focusTarget(model, group))) |msg| return msg;
+    for (default_rows, 0..) |row, index| {
+        if (sameAgent(row, group.name)) return Msg{ .launch_rail_agent = @intCast(index) };
+    }
+    return null;
+}
+
 var strip_labels: [32][96]u8 = undefined;
 
 /// A live status line for one agent, for the Agents list in Settings: the
@@ -838,9 +849,9 @@ pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
     for (groups.slice(), 0..) |*group, slot| {
         const ext_h = rowCell(model, group.name) + ext_overhang * 2;
         cells[slot] = if (petPxFor(model, group.name)) |px|
-            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs, focusMsg(model, focusTarget(model, group)), levelup.progress(model.now_ms, model.levelup_at_ms[petSlot(group.name).?]))
+            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs, groupPress(model, group), levelup.progress(model.now_ms, model.levelup_at_ms[petSlot(group.name).?]))
         else
-            ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons, focusMsg(model, focusTarget(model, group)));
+            ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons, groupPress(model, group));
         // Each slot is a little taller than the ring and the gaps shrink to
         // match, so the extension overhangs the row without moving it.
         const body = if (group.count > 1)
@@ -1230,4 +1241,15 @@ test "an ended session leaves the tab and is counted as resolved" {
     try std.testing.expectEqualStrings("codex", model.entries[0].agentSlice());
     try std.testing.expectEqual(@as(u16, 1), model.earned_resolved[petSlot("claude-code").?]);
     try std.testing.expect(!endSession(&model, bubbles[0].identity()));
+}
+
+test "an idle row opens its agent's app when pressed" {
+    var model: Model = .{};
+    const groups = groupsOf(&model);
+    try std.testing.expectEqual(@as(u8, 2), groupPress(&model, &groups.items[2]).?.launch_rail_agent);
+    var out: [max_entries]Transition = undefined;
+    const bubbles = [_]hook_server.Bubble{testBubble("a", "claude-code", .running)};
+    _ = reconcile(&model, &bubbles, 1000, &out);
+    const live = groupsOf(&model);
+    try std.testing.expectEqual(@as(u16, 0), groupPress(&model, &live.items[0]).?.focus_rail_session);
 }

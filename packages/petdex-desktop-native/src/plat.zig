@@ -1079,7 +1079,6 @@ pub fn activateHerdrPane(home: []const u8, pane_raw: []const u8) bool {
 
 pub fn activateOriginApplication(origin: OriginApplication, source_tty: []const u8, source_cwd: []const u8) bool {
     if (builtin.os.tag != .macos) return false;
-    _ = source_cwd;
     if (origin == .default_browser) return activateRunningDefaultBrowser().succeeded();
     if (origin == .terminal) {
         if (safeSourceTty(source_tty)) |tty| {
@@ -1087,6 +1086,13 @@ pub fn activateOriginApplication(origin: OriginApplication, source_tty: []const 
         }
     }
     const bundle_id = origin.bundleIdentifier() orelse return false;
+    // An editor given the session's folder raises the window that has it
+    // open, which is the closest thing to "that thread's window".
+    if (origin == .vscode) {
+        if (safeSourceCwd(source_cwd)) |dir| {
+            if (spawnAndWait(&.{ "/usr/bin/open", "-b", bundle_id, dir })) return true;
+        }
+    }
     return spawnAndWait(&.{ "/usr/bin/open", "-b", bundle_id });
 }
 

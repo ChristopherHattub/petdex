@@ -123,6 +123,7 @@ pub const Msg = union(enum) {
     toggle_agent_pets,
     /// Index into the rail's entries: jump to that session's chat.
     focus_rail_session: u16,
+    launch_rail_agent: u8,
     set_agent_pet_size_claude: f32,
     set_agent_pet_size_gemini: f32,
     set_agent_pet_size_codex: f32,
@@ -3251,6 +3252,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .shuffle_pet => advancePet(model, fx),
         .quit_app => plat.requestQuit(),
+        .launch_rail_agent => |row| {
+            if (row >= agent_rail.default_rows.len) return;
+            _ = activateAgentApp(agent_rail.default_rows[row]);
+        },
         .focus_rail_session => |index| {
             if (index >= model.rail.len) return;
             _ = activateRailSession(&model.rail.entries[index]);
@@ -4429,10 +4434,19 @@ fn activateRailSession(entry: *const agent_rail.Entry) bool {
         if (entry.herdr_pane_len > 0 and plat.activateHerdrPane(home, entry.herdrPaneSlice())) return true;
     }
     if (entry.origin_app != .none and plat.activateOriginApplication(entry.origin_app, entry.ttySlice(), entry.cwdSlice())) return true;
-    const kind = agentKindForName(entry.agentSlice()) orelse return false;
+    return activateAgentAppIn(entry.agentSlice(), entry.cwdSlice());
+}
+
+/// Open an agent's desktop app, with no particular session in mind.
+fn activateAgentApp(name: []const u8) bool {
+    return activateAgentAppIn(name, "");
+}
+
+fn activateAgentAppIn(name: []const u8, cwd: []const u8) bool {
+    const kind = agentKindForName(name) orelse return false;
     switch (kind) {
         .claude_code => return plat.activateAppByName("Claude", null),
-        .gemini => return plat.activateAppByName("Antigravity", entry.cwdSlice()),
+        .gemini => return plat.activateAppByName("Antigravity", if (cwd.len > 0) cwd else null),
         .codex => return plat.activateAppByName("Codex", null) or plat.activateAppByName("ChatGPT", null),
         else => return false,
     }

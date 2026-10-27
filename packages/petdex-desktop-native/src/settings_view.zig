@@ -721,6 +721,7 @@ fn dexBottomBar(ui: *AppUi, model: *const Model) AppUi.Node {
     return bar;
 }
 
+const card_owner = [_][]const u8{ "Claude Code", "Antigravity", "Codex" };
 var level_labels: [max_catalog + 4][24]u8 = undefined;
 var xp_labels: [4][32]u8 = undefined;
 
@@ -774,14 +775,19 @@ fn dexGrid(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, filter: []const 
             Msg{ .set_agent_pet = @intCast((sl << 16) | i) }
         else
             Msg{ .select_pet = @intCast(i) };
-        const number = std.fmt.bufPrint(&dex_labels[i], "No. {d:0>3}", .{i + 1}) catch "No.";
+        const taken: ?usize = if (slot) |sl| app.agentPetTakenBy(model, i, sl) else null;
+        const number = if (taken) |other|
+            std.fmt.bufPrint(&dex_labels[i], "On {s}", .{card_owner[other]}) catch "In use"
+        else
+            std.fmt.bufPrint(&dex_labels[i], "No. {d:0>3}", .{i + 1}) catch "No.";
         var card = ui.el(.list_item, .{
             .grow = 1,
             .height = if (deletable) 176 else 150,
             .padding = 8,
             .main = .center,
             .cross = .center,
-            .on_press = press,
+            .on_press = if (taken != null) null else press,
+            .disabled = taken != null,
             .style_tokens = .{ .background = .surface, .radius = .md },
             .semantics = .{ .label = entry.slice() },
         }, .{

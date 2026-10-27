@@ -268,6 +268,8 @@ pub const Model = struct {
     main_levelup_at_ms: i64 = -levelup_ms,
     /// Clock the level-up flourish reads; see the poll tick.
     fx_now_ms: i64 = 0,
+    /// Bumped whenever an Agent-Pet animation row is rebuilt, so views repaint.
+    agent_anim_rev: u32 = 0,
     sheet_loaded: bool = false,
     pet_name: [64]u8 = @splat(0),
     pet_name_len: usize = 0,
@@ -2008,11 +2010,13 @@ fn downscaleFrame(sheet_pixels: []const u8, sheet_w: usize, src_x: usize, src_y:
 
 /// Build the animation rows for at most one slot whose pet changed. The
 /// decode is the slow part, so like the thumbnails it takes one per tick.
-fn buildAgentAnim(model: *const Model, fx: *Effects) void {
+fn buildAgentAnim(model: *Model, fx: *Effects) void {
     for (0..agent_rail.pet_slots) |slot| {
         const index = agentPetCatalogIndex(model, slot) orelse continue;
         const name = catalog[index].slice();
-        if (std.mem.eql(u8, agent_anim_built[slot][0..agent_anim_built_len[slot]], name) and agent_anim_ready[slot]) continue;
+        // A pet that failed to decode is not retried either: it is marked
+        // built, and one broken sheet must not hold up the slots after it.
+        if (std.mem.eql(u8, agent_anim_built[slot][0..agent_anim_built_len[slot]], name)) continue;
         if (agent_anim_pixels.len == 0) {
             agent_anim_pixels = boot_allocator.alloc(u8, anim_atlas_w * anim_atlas_h * 4) catch return;
             @memset(agent_anim_pixels, 0);
@@ -2023,6 +2027,7 @@ fn buildAgentAnim(model: *const Model, fx: *Effects) void {
         agent_anim_built_len[slot] = @intCast(name.len);
         var decoded = decodeSheetForThumb(fx, &catalog[index]) orelse {
             agent_anim_ready[slot] = false;
+            model.agent_anim_rev +%= 1;
             return;
         };
         defer freeSheet(&decoded);
@@ -2041,6 +2046,9 @@ fn buildAgentAnim(model: *const Model, fx: *Effects) void {
         fx.registerImage(agent_anim_atlas_id, anim_atlas_w, anim_atlas_h, agent_anim_pixels) catch {
             agent_anim_ready[slot] = false;
         };
+        // The atlas lives outside the model, so without a model change the
+        // rail would keep showing the frames it drew before the rebuild.
+        model.agent_anim_rev +%= 1;
         return;
     }
 }
@@ -3254,12 +3262,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             @memcpy(model.agent_pet_name[slot][0..name.len], name);
             model.agent_pet_name_len[slot] = @intCast(name.len);
             model.agent_pet_picker = 0;
+            // Stop drawing the old pet's frames until the new row is built;
+            // the still of the new pet stands in meanwhile.
+            agent_anim_ready[slot] = false;
             saveSettings(model);
         },
         .reset_agent_pet => |slot| {
             if (slot >= agent_rail.pet_slots) return;
             model.agent_pet_name_len[slot] = 0;
             model.agent_pet_picker = 0;
+            agent_anim_ready[slot] = false;
             saveSettings(model);
         },
         .toggle_section => |index| {

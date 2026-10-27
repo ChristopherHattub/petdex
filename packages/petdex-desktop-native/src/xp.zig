@@ -12,6 +12,8 @@ const plat = @import("plat.zig");
 pub const cycle_xp: u64 = 10;
 /// A thread that finished and left the tab.
 pub const thread_xp: u64 = 15;
+/// A thread the agent reported as ended (resolved or closed).
+pub const resolved_xp: u64 = 30;
 /// Per full minute an agent spends working.
 pub const minute_xp: u64 = 1;
 

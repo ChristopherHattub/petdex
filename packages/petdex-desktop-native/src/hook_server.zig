@@ -665,6 +665,27 @@ const BlockingMutex = struct {
     }
 };
 
+/// A conversation whose agent reported the session over (SessionEnd). The
+/// desktop drops its tab entry and credits the pet for the resolved thread.
+pub const EndedSession = struct {
+    session: [bubble_session_capacity]u8 = @splat(0),
+    session_len: usize = 0,
+    agent: [24]u8 = @splat(0),
+    agent_len: usize = 0,
+    hostname: [64]u8 = @splat(0),
+    hostname_len: usize = 0,
+    remote: bool = false,
+
+    pub fn identity(self: *const EndedSession) BubbleIdentity {
+        return .{
+            .conversation_key = self.session[0..self.session_len],
+            .agent = self.agent[0..self.agent_len],
+            .hostname = self.hostname[0..self.hostname_len],
+            .remote = self.remote,
+        };
+    }
+};
+
 pub const Mailbox = struct {
     /// In-process diagnostic counters for duplicate/stale feed behavior.
     /// They deliberately stay with each mailbox instance and are not emitted
@@ -690,6 +711,8 @@ pub const Mailbox = struct {
     bubbles_dirty: bool = false,
     deferred_children: [max_deferred_child_messages]DeferredChildMessage = @splat(.{}),
     deferred_children_len: usize = 0,
+    ended: [max_bubbles]EndedSession = @splat(.{}),
+    ended_len: usize = 0,
     /// Monotonic across every session, so a bubble's counter doubles as
     /// its LRU stamp: the smallest one is the least recently updated.
     bubble_counter: u64 = 0,
@@ -925,6 +948,12 @@ pub const Mailbox = struct {
             }
         }
 
+        if (update.session_kind != .subagent and update.conversation_key.len > 0 and
+            std.mem.eql(u8, update.event_kind, "session-end"))
+        {
+            return self.endSessionLocked(update);
+        }
+
         var matched_existing: ?*Bubble = null;
         for (self.bubbles[0..self.bubbles_len]) |*bubble| {
             if (identityMatches(bubble, update)) {
@@ -1046,6 +1075,42 @@ pub const Mailbox = struct {
         slot.counter = self.bubble_counter;
         self.bubbles_dirty = true;
         return slot.counter;
+    }
+
+    /// The agent said this conversation is over: drop its card and queue it
+    /// for the consumer, which removes the tab entry and pays out XP.
+    fn endSessionLocked(self: *Mailbox, update: BubbleUpdate) u64 {
+        var index: usize = 0;
+        while (index < self.bubbles_len) : (index += 1) {
+            if (!identityMatches(&self.bubbles[index], update)) continue;
+            if (index + 1 < self.bubbles_len)
+                std.mem.copyForwards(Bubble, self.bubbles[index .. self.bubbles_len - 1], self.bubbles[index + 1 .. self.bubbles_len]);
+            self.bubbles_len -= 1;
+            self.bubbles[self.bubbles_len] = .{};
+            break;
+        }
+        if (self.ended_len < max_bubbles) {
+            var ended: EndedSession = .{};
+            ended.session_len = copyField(&ended.session, update.conversation_key);
+            ended.agent_len = copyField(&ended.agent, update.agent);
+            ended.hostname_len = copyField(&ended.hostname, update.hostname);
+            ended.remote = update.remote;
+            self.ended[self.ended_len] = ended;
+            self.ended_len += 1;
+        }
+        self.bubble_counter += 1;
+        self.bubbles_dirty = true;
+        return self.bubble_counter;
+    }
+
+    /// Conversations that ended since the last call.
+    pub fn takeEnded(self: *Mailbox, out: *[max_bubbles]EndedSession) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const count = self.ended_len;
+        @memcpy(out[0..count], self.ended[0..count]);
+        self.ended_len = 0;
+        return count;
     }
 
     /// Record per-agent attention for a session that already has a slot.
@@ -3665,4 +3730,17 @@ fn bubbleMirrorJson(allocator: std.mem.Allocator, text: []const u8, counter: u64
         .counter = counter,
         .at = at,
     }, .{});
+}
+
+test "a session-end update drops the card and queues the conversation as ended" {
+    var mb: Mailbox = .{};
+    var out: [max_bubbles]Bubble = undefined;
+    var ended: [max_bubbles]EndedSession = undefined;
+    _ = mb.applyBubbleUpdate(.{ .conversation_key = "thread-1", .agent = "claude-code", .text = "working", .status = .running });
+    try std.testing.expectEqual(@as(?usize, 1), mb.takeBubbles(&out));
+    _ = mb.applyBubbleUpdate(.{ .conversation_key = "thread-1", .agent = "claude-code", .text = "", .event_kind = "session-end", .status = .completed });
+    try std.testing.expectEqual(@as(?usize, 0), mb.takeBubbles(&out));
+    try std.testing.expectEqual(@as(usize, 1), mb.takeEnded(&ended));
+    try std.testing.expectEqualStrings("claude-code", ended[0].identity().agent);
+    try std.testing.expectEqual(@as(usize, 0), mb.takeEnded(&ended));
 }

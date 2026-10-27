@@ -121,7 +121,8 @@ pub fn run(raw_phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.Origi
     // task that ran while Petdex was closed to be recovered on next launch.
     var bubble_body_buf: [post_body_capacity]u8 = undefined;
     var bubble_body: ?[]const u8 = null;
-    if (text.len > 0 and shouldPostBubble(agent, phase)) {
+    // A session end carries no text but must still reach the desktop.
+    if ((text.len > 0 or std.mem.eql(u8, phase, "session-end")) and shouldPostBubble(agent, phase)) {
         const correlation_id = firstJsonString(payload, &.{ "request_id", "tool_use_id", "message_id", "event_id", "call_id", "turn_id", "turnId" });
         const is_request = status == .needs_input;
         const is_response = std.mem.eql(u8, phase, "approval-response") or

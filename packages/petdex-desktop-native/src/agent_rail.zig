@@ -155,6 +155,7 @@ pub const Model = struct {
     now_ms: i64 = 0,
     earned_cycles: [pet_slots + 1]u16 = @splat(0),
     earned_threads: [pet_slots + 1]u16 = @splat(0),
+    earned_resolved: [pet_slots + 1]u16 = @splat(0),
     pet_px: [pet_slots]f32 = @splat(default_pet_px),
     /// Thumbnail-atlas index of the pet each default row shows.
     pet_thumb: [pet_slots]?usize = @splat(null),
@@ -267,6 +268,15 @@ fn noteDone(model: *Model, entry: *Entry, to: Status) void {
     entry.cycles +|= 1;
     const slot = earnSlot(entry);
     model.earned_cycles[slot] +|= 1;
+}
+
+/// The agent reported this conversation over: its entry leaves the tab at
+/// once and its pet is credited a resolved thread.
+pub fn endSession(model: *Model, identity: hook_server.BubbleIdentity) bool {
+    const index = indexOf(model, identity) orelse return false;
+    model.earned_resolved[earnSlot(&model.entries[index])] +|= 1;
+    removeAt(model, index, null);
+    return true;
 }
 
 /// True while some row's pet moves; idle pets hold frame 0, so the clock
@@ -1205,4 +1215,19 @@ test "extension icons are centred inside their tab" {
     try std.testing.expectEqual((panel_w - row_w) / 2, row.widget.frame.x);
     try std.testing.expectEqual((panel_h - row.widget.layout.min_size.height) / 2, row.widget.frame.y);
     try std.testing.expect(row.widget.frame.x + row_w <= panel_w);
+}
+
+test "an ended session leaves the tab and is counted as resolved" {
+    var model: Model = .{};
+    var out: [max_entries]Transition = undefined;
+    const bubbles = [_]hook_server.Bubble{
+        testBubble("a", "claude-code", .running),
+        testBubble("b", "codex", .running),
+    };
+    _ = reconcile(&model, &bubbles, 1000, &out);
+    try std.testing.expect(endSession(&model, bubbles[0].identity()));
+    try std.testing.expectEqual(@as(usize, 1), model.len);
+    try std.testing.expectEqualStrings("codex", model.entries[0].agentSlice());
+    try std.testing.expectEqual(@as(u16, 1), model.earned_resolved[petSlot("claude-code").?]);
+    try std.testing.expect(!endSession(&model, bubbles[0].identity()));
 }

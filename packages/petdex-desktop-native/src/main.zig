@@ -231,7 +231,9 @@ fn awardXp(model: *Model, now: i64) void {
     var gained = false;
     for (0..agent_rail.pet_slots + 1) |slot| {
         var amount: u64 = @as(u64, model.rail.earned_cycles[slot]) * xp_mod.cycle_xp +
-            @as(u64, model.rail.earned_threads[slot]) * xp_mod.thread_xp;
+            @as(u64, model.rail.earned_threads[slot]) * xp_mod.thread_xp +
+            @as(u64, model.rail.earned_resolved[slot]) * xp_mod.resolved_xp;
+        model.rail.earned_resolved[slot] = 0;
         model.rail.earned_cycles[slot] = 0;
         model.rail.earned_threads[slot] = 0;
         if (slot < agent_rail.pet_slots) {
@@ -3595,6 +3597,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Ahead of the bubble branch: the rail shows agents even
                 // with bubbles off, and keeps finished ones after their
                 // card expires.
+                // Conversations the agent closed leave the tab before the
+                // reconcile can re-add them from a lingering card.
+                var ended: [hook_server.max_bubbles]hook_server.EndedSession = undefined;
+                const ended_count = hook_server.mailbox.takeEnded(&ended);
+                for (ended[0..ended_count]) |*gone| _ = agent_rail.endSession(&model.rail, gone.identity());
                 var rail_edges: [agent_rail.max_entries]agent_rail.Transition = undefined;
                 const edge_count = agent_rail.reconcile(&model.rail, drained[0..raw_count], now, &rail_edges);
                 ntfy.onTransitions(&model.ntfy, fx, &model.rail, rail_edges[0..edge_count], drained[0..raw_count], now);

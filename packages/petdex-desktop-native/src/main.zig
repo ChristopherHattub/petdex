@@ -34,6 +34,7 @@ pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 const agent_rail = @import("agent_rail.zig");
 const xp_mod = @import("xp.zig");
+const levelup_mod = @import("levelup.zig");
 const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
@@ -207,7 +208,7 @@ pub fn agentPetCatalogIndex(model: *const Model, slot: usize) ?usize {
 }
 
 /// How long the level-up flourish plays on a pet.
-pub const levelup_ms: i64 = 1800;
+pub const levelup_ms: i64 = levelup_mod.duration_ms;
 
 /// Credit XP to the pets that earned it. Agent rows feed their own pet and
 /// the main pet; if both are the same pet it is paid once.
@@ -250,6 +251,14 @@ fn awardXp(model: *Model, now: i64) void {
     };
 }
 
+fn flourishLive(model: *const Model, now: i64) bool {
+    if (levelup_mod.active(now, model.main_levelup_at_ms)) return true;
+    for (model.levelup_at_ms) |at| {
+        if (levelup_mod.active(now, at)) return true;
+    }
+    return false;
+}
+
 pub const Model = struct {
     xp: xp_mod.Store = .{},
     xp_work_ms: [agent_rail.pet_slots]i64 = @splat(0),
@@ -257,6 +266,8 @@ pub const Model = struct {
     /// When each Agent-Pet, and the main pet, last levelled up.
     levelup_at_ms: [agent_rail.pet_slots]i64 = @splat(-levelup_ms),
     main_levelup_at_ms: i64 = -levelup_ms,
+    /// Clock the level-up flourish reads; see the poll tick.
+    fx_now_ms: i64 = 0,
     sheet_loaded: bool = false,
     pet_name: [64]u8 = @splat(0),
     pet_name_len: usize = 0,
@@ -3608,6 +3619,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = expireBubbles(model, now);
             _ = agent_rail.expire(&model.rail, now);
             awardXp(model, now);
+            // The flourish reads this clock instead of the coarse anim one;
+            // it only advances while one plays (plus one tick to clear it),
+            // so an idle app is not redrawn.
+            if (flourishLive(model, model.fx_now_ms) or flourishLive(model, now)) {
+                model.fx_now_ms = now;
+                model.rail.now_ms = now;
+            }
             // A newly drained bubble is declared as a popup in the same
             // update pass. Compute Linux's side after expiry and before
             // that declaration so the first rendered frame uses the same
@@ -4856,6 +4874,18 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     node.widget.image_fit = .stretch;
     node.widget.image_sampling = .nearest;
+    var shown = node;
+    if (levelup_mod.progress(model.fx_now_ms, model.main_levelup_at_ms)) |t| {
+        // Hop and sparkle inside a panel exactly the sprite's size, so the
+        // window and its layout do not change for the flourish.
+        node.widget.frame.y = levelup_mod.hop(t, h);
+        var stars: [levelup_mod.sparkle_count]AppUi.Node = undefined;
+        const lit = levelup_mod.sparkles(ui, @min(w, h), 0, t, &stars);
+        var kids: [1 + levelup_mod.sparkle_count]AppUi.Node = undefined;
+        kids[0] = node;
+        @memcpy(kids[1..][0..lit.len], lit);
+        shown = ui.el(.panel, .{ .width = w, .height = h, .padding = 0 }, @as([]const AppUi.Node, kids[0 .. 1 + lit.len]));
+    }
     // Linux hands primary presses to the compositor through GTK/GDK;
     // secondary presses still follow the canvas context-menu route.
     if (builtin.target.os.tag == .linux) {
@@ -4864,13 +4894,13 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         // hit route before mounting the canvas fallback menu.
         node.context_menu = &pet_menu;
         return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = &pet_menu }, .{
-            node,
+            shown,
             ui.el(.stack, .{ .width = 1, .height = pet_edge_pad }, .{}),
         });
     }
     // Win/mac keep the upstream sprite-only root and app-owned drag path;
     // their bubble is a separate companion window.
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{node});
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{shown});
 }
 
 // ----------------------------------------------------------- bubble
@@ -5245,6 +5275,7 @@ fn syncRailWindow(model: *Model, fx: *Effects) void {
     for (0..agent_rail.pet_slots) |slot| {
         model.rail.pet_px[slot] = model.agent_pet_px[slot];
         model.rail.pet_thumb[slot] = agentPetCatalogIndex(model, slot);
+        model.rail.levelup_at_ms[slot] = model.levelup_at_ms[slot];
     }
     agent_rail.sync(&model.rail, fx, model.pet_x, model.pet_y, frame_w * model.scale, frame_h * model.scale);
 }
@@ -7424,6 +7455,7 @@ test "empty stack does not activate an application" {
 
 test {
     _ = xp_mod;
+    _ = levelup_mod;
 }
 
 test "finished cycles and minutes of work feed the agent pet and the main pet" {

@@ -30,6 +30,7 @@ const geometry = native_sdk.geometry;
 const sprite = @import("sprite.zig");
 const plat = @import("plat.zig");
 const hook_server = @import("hook_server.zig");
+const levelup = @import("levelup.zig");
 
 const app = @import("main.zig");
 const AppUi = app.AppUi;
@@ -148,6 +149,10 @@ pub const Model = struct {
     /// XP bookkeeping, drained by main.zig each tick: cycles finished and
     /// threads that completed and left the tab, per pet slot (the last
     /// bucket is every agent without a pet row).
+    /// When each Agent-Pet last levelled up, and the clock the flourish
+    /// reads (main.zig keeps it fresh only while one is playing).
+    levelup_at_ms: [pet_slots]i64 = @splat(-levelup.duration_ms),
+    now_ms: i64 = 0,
     earned_cycles: [pet_slots + 1]u16 = @splat(0),
     earned_threads: [pet_slots + 1]u16 = @splat(0),
     pet_px: [pet_slots]f32 = @splat(default_pet_px),
@@ -639,7 +644,7 @@ fn ringedIcon(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, 
 
 /// Agent-Pets row: the pet's thumbnail inside the status ring, with the
 /// agent's logo on a dark chip in the top-right corner.
-pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, slot: usize, thumb: usize, anim_ms: i64, icons: IconAtlas, thumbs: ThumbAtlas, press: ?Msg) AppUi.Node {
+pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u8, px: f32, slot: usize, thumb: usize, anim_ms: i64, icons: IconAtlas, thumbs: ThumbAtlas, press: ?Msg, flourish: ?f32) AppUi.Node {
     const cell = cellOf(px, ring_px, ring_gap);
     const pad = ring_px + ring_gap;
     const ready = thumb < thumbs.ready.len and thumbs.ready[thumb];
@@ -662,6 +667,7 @@ pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u
     }
     pet.widget.image_fit = .contain;
     pet.widget.image_sampling = .linear;
+    if (flourish) |t| pet.widget.frame.y = levelup.hop(t, px);
 
     const badge = px * badge_fraction;
     const logo = badge - 3;
@@ -690,6 +696,28 @@ pub fn ringedPet(ui: *AppUi, agent: []const u8, status: Status, label: []const u
     ring.widget.style.radius = cell / 2;
     ring.widget.style.background = canvas.Color.rgba8(255, 255, 255, 18);
     ring.widget.style.border = ringColor(status);
+    if (flourish) |t| {
+        var stars: [levelup.sparkle_count]AppUi.Node = undefined;
+        // The ring panel is built before its sparkles exist, so rebuild it
+        // with them as extra children while a level-up plays.
+        const lit = levelup.sparkles(ui, px, pad, t, &stars);
+        var kids: [2 + levelup.sparkle_count]AppUi.Node = undefined;
+        kids[0] = pet;
+        kids[1] = chip;
+        @memcpy(kids[2..][0..lit.len], lit);
+        ring = ui.el(.panel, .{
+            .width = cell,
+            .height = cell,
+            .padding = pad,
+            .on_press = press,
+            .semantics = .{ .label = label },
+        }, @as([]const AppUi.Node, kids[0 .. 2 + lit.len]));
+        ring.widget.style.radius = cell / 2;
+        ring.widget.style.background = canvas.Color.rgba8(255, 214, 64, 40);
+        ring.widget.style.border = levelup.gold(t);
+        ring.widget.style.stroke_width = ring_px;
+        return ring;
+    }
     ring.widget.style.stroke_width = ring_px;
     return ring;
 }
@@ -784,7 +812,7 @@ pub fn railView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: Thumb
     for (groups.slice(), 0..) |*group, slot| {
         const ext_h = rowCell(model, group.name) + ext_overhang * 2;
         cells[slot] = if (petPxFor(model, group.name)) |px|
-            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs, focusMsg(model, focusTarget(model, group)))
+            ringedPet(ui, group.name, group.status, groupLabel(model, group, slot), px, petSlot(group.name).?, model.pet_thumb[petSlot(group.name).?].?, model.anim_ms, icons, thumbs, focusMsg(model, focusTarget(model, group)), levelup.progress(model.now_ms, model.levelup_at_ms[petSlot(group.name).?]))
         else
             ringedIcon(ui, group.name, group.status, groupLabel(model, group, slot), main_sizes, icons, focusMsg(model, focusTarget(model, group)));
         // Each slot is a little taller than the ring and the gaps shrink to

@@ -33,6 +33,7 @@ const sdk_log = @import("sdk_log.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 const agent_rail = @import("agent_rail.zig");
+const xp_mod = @import("xp.zig");
 const ntfy = @import("ntfy.zig");
 pub const updates = @import("updates.zig");
 
@@ -205,7 +206,57 @@ pub fn agentPetCatalogIndex(model: *const Model, slot: usize) ?usize {
     return null;
 }
 
+/// How long the level-up flourish plays on a pet.
+pub const levelup_ms: i64 = 1800;
+
+/// Credit XP to the pets that earned it. Agent rows feed their own pet and
+/// the main pet; if both are the same pet it is paid once.
+fn awardXp(model: *Model, now: i64) void {
+    const dt: i64 = if (model.xp_last_ms > 0) std.math.clamp(now - model.xp_last_ms, 0, 5000) else 0;
+    model.xp_last_ms = now;
+    var main_total: u64 = 0;
+    var gained = false;
+    for (0..agent_rail.pet_slots + 1) |slot| {
+        var amount: u64 = @as(u64, model.rail.earned_cycles[slot]) * xp_mod.cycle_xp +
+            @as(u64, model.rail.earned_threads[slot]) * xp_mod.thread_xp;
+        model.rail.earned_cycles[slot] = 0;
+        model.rail.earned_threads[slot] = 0;
+        if (slot < agent_rail.pet_slots) {
+            for (model.rail.entries[0..model.rail.len]) |*entry| {
+                if (entry.status == .working and agent_rail.petSlot(entry.agentSlice()) == slot) {
+                    model.xp_work_ms[slot] += dt;
+                    break;
+                }
+            }
+            while (model.xp_work_ms[slot] >= 60_000) {
+                model.xp_work_ms[slot] -= 60_000;
+                amount += xp_mod.minute_xp;
+            }
+        }
+        if (amount == 0) continue;
+        gained = true;
+        main_total += amount;
+        if (slot >= agent_rail.pet_slots) continue;
+        const index = agentPetCatalogIndex(model, slot) orelse continue;
+        const name = catalog_mod.catalog[index].slice();
+        if (std.mem.eql(u8, name, model.pet_name[0..model.pet_name_len])) continue;
+        if (model.xp.add(name, amount) != null) model.levelup_at_ms[slot] = now;
+    }
+    if (main_total > 0 and model.pet_name_len > 0) {
+        if (model.xp.add(model.pet_name[0..model.pet_name_len], main_total) != null) model.main_levelup_at_ms = now;
+    }
+    if (gained) if (env_home) |home| {
+        _ = xp_mod.save(boot_allocator, home, &model.xp);
+    };
+}
+
 pub const Model = struct {
+    xp: xp_mod.Store = .{},
+    xp_work_ms: [agent_rail.pet_slots]i64 = @splat(0),
+    xp_last_ms: i64 = 0,
+    /// When each Agent-Pet, and the main pet, last levelled up.
+    levelup_at_ms: [agent_rail.pet_slots]i64 = @splat(-levelup_ms),
+    main_levelup_at_ms: i64 = -levelup_ms,
     sheet_loaded: bool = false,
     pet_name: [64]u8 = @splat(0),
     pet_name_len: usize = 0,
@@ -2422,6 +2473,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.hide_dock = initial_hide_dock;
     model.agent_pets = initial_agent_pets;
     model.agent_pet_px = initial_agent_pet_px;
+    if (env_home) |home| model.xp = xp_mod.load(boot_allocator, home);
     model.agent_pet_name = initial_agent_pet_name;
     model.agent_pet_name_len = initial_agent_pet_name_len;
     model.rotate_pets = initial_rotate_pets;
@@ -3555,6 +3607,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             _ = expireBubbles(model, now);
             _ = agent_rail.expire(&model.rail, now);
+            awardXp(model, now);
             // A newly drained bubble is declared as a popup in the same
             // update pass. Compute Linux's side after expiry and before
             // that declaration so the first rendered frame uses the same
@@ -7367,4 +7420,24 @@ test "empty stack does not activate an application" {
         }
     };
     try std.testing.expect(!focusNewestBubble(&model, Focus.activate));
+}
+
+test {
+    _ = xp_mod;
+}
+
+test "finished cycles and minutes of work feed the agent pet and the main pet" {
+    var model: Model = .{};
+    @memcpy(model.pet_name[0..4], "boba");
+    model.pet_name_len = 4;
+    model.rail.earned_cycles[0] = 2;
+    model.rail.earned_threads[3] = 1;
+    awardXp(&model, 1000);
+    // Slot 0's pet is the active pet here, so the main pet is paid once:
+    // 2 cycles + 1 thread from an agent without a pet row.
+    try std.testing.expectEqual(@as(u64, 2 * xp_mod.cycle_xp + xp_mod.thread_xp), model.xp.xpOf("boba"));
+    try std.testing.expectEqual(@as(i64, -levelup_ms), model.levelup_at_ms[0]);
+    model.rail.earned_cycles[3] = 4;
+    awardXp(&model, 2000);
+    try std.testing.expectEqual(@as(i64, 2000), model.main_levelup_at_ms);
 }

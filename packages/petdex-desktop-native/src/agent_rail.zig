@@ -97,6 +97,8 @@ pub const Entry = struct {
     status: Status = .idle,
     /// When `status` last changed. Drives the linger for settled entries.
     since_ms: i64 = 0,
+    /// Finished work cycles (red, then green) this session has completed.
+    cycles: u16 = 0,
 
     pub fn agentSlice(self: *const Entry) []const u8 {
         return self.agent[0..self.agent_len];
@@ -143,6 +145,11 @@ pub const Model = struct {
     /// Agent-Pets: the three default rows show a mini pet instead of the
     /// agent logo. Filled by main.zig from the settings each frame.
     pets_on: bool = false,
+    /// XP bookkeeping, drained by main.zig each tick: cycles finished and
+    /// threads that completed and left the tab, per pet slot (the last
+    /// bucket is every agent without a pet row).
+    earned_cycles: [pet_slots + 1]u16 = @splat(0),
+    earned_threads: [pet_slots + 1]u16 = @splat(0),
     pet_px: [pet_slots]f32 = @splat(default_pet_px),
     /// Thumbnail-atlas index of the pet each default row shows.
     pet_thumb: [pet_slots]?usize = @splat(null),
@@ -224,6 +231,7 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
                 out[transitions] = .{ .index = index, .from = entry.status, .to = next };
                 transitions += 1;
             }
+            noteDone(model, entry, next);
             entry.status = next;
             entry.since_ms = now_ms;
         }
@@ -235,10 +243,25 @@ pub fn reconcile(model: *Model, bubbles: []const hook_server.Bubble, now_ms: i64
             out[transitions] = .{ .index = index, .from = entry.status, .to = .done };
             transitions += 1;
         }
+        noteDone(model, entry, .done);
         entry.status = .done;
         entry.since_ms = now_ms;
     }
     return transitions;
+}
+
+/// Slot a finished cycle or thread is credited to: the agent's pet row, or
+/// the shared last bucket for agents without one.
+fn earnSlot(entry: *const Entry) usize {
+    return petSlot(entry.agentSlice()) orelse pet_slots;
+}
+
+/// Count a red-then-green cycle when `entry` is about to move to `to`.
+fn noteDone(model: *Model, entry: *Entry, to: Status) void {
+    if (to != .done or (entry.status != .working and entry.status != .waiting)) return;
+    entry.cycles +|= 1;
+    const slot = earnSlot(entry);
+    model.earned_cycles[slot] +|= 1;
 }
 
 fn indexOf(model: *const Model, identity: hook_server.BubbleIdentity) ?usize {
@@ -283,6 +306,7 @@ pub fn expire(model: *Model, now_ms: i64) bool {
     while (index < model.len) {
         const entry = &model.entries[index];
         if (entry.status.settles() and now_ms - entry.since_ms >= done_linger_ms) {
+            if (entry.cycles > 0) model.earned_threads[earnSlot(entry)] +|= 1;
             removeAt(model, index, null);
             changed = true;
             continue;

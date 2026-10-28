@@ -1,10 +1,12 @@
 //! Pet evolution: every pet belongs to an evolution tree.
 //!
-//! Traditional trees (a species turning into a later one at a level) are
-//! listed in `traditional`; it starts empty and grows as real evolution
-//! lines are added to the collection. A pet that is in no traditional tree
-//! follows the default tree: its own sprite, tinted purple at its first
-//! evolution and gold at its second.
+//! Traditional trees (a species turning into a later one) are listed in
+//! `traditional`. Evolving never replaces a pet: reaching the step's level
+//! unlocks the next species as its own collection entry while the earlier
+//! one stays. Until then the later species is locked and hidden from the
+//! collection. A pet that is in no traditional tree follows the default
+//! tree: its own sprite, tinted purple at its first evolution and gold at
+//! its second.
 
 const std = @import("std");
 
@@ -14,16 +16,20 @@ pub const second_evolution_level: u32 = 12;
 
 pub const Tint = enum(u8) { none, purple, gold };
 
-/// One step of a traditional line: `from` becomes `to` at `level`.
+/// One step of a traditional line: `to` unlocks once `from` reaches `level`.
 pub const Step = struct {
     from: []const u8,
     to: []const u8,
     level: u32,
 };
 
-/// Pokémon-style lines, by pet slug. Add entries as those pets are added to
-/// the collection, e.g. `.{ .from = "charmander", .to = "charmeleon", .level = 16 }`.
-pub const traditional = [_]Step{};
+/// Pokémon-style lines, by pet slug. Levels follow the shape of 16 and 36
+/// scaled to this XP curve and counted in the earlier pet's own XP: level 5
+/// (360 XP) and level 8 (840 XP).
+pub const traditional = [_]Step{
+    .{ .from = "squirtle", .to = "wartortle", .level = 5 },
+    .{ .from = "wartortle", .to = "blastoise", .level = 8 },
+};
 
 /// Evolution stage for a level in the default tree: 0 base, 1, 2.
 pub fn stageFor(level: u32) u8 {
@@ -48,34 +54,25 @@ pub fn inTraditionalTree(slug: []const u8) bool {
     return false;
 }
 
-/// The species a pet has become at `level`, following its traditional line
-/// as far as the level allows. Null when it has not evolved (or is not in
-/// a traditional tree).
-pub fn traditionalForm(slug: []const u8, level: u32) ?[]const u8 {
-    var current = slug;
-    var moved = false;
-    var hops: usize = 0;
-    while (hops < traditional.len) : (hops += 1) {
-        var advanced = false;
-        for (traditional) |step| {
-            if (std.mem.eql(u8, step.from, current) and level >= step.level) {
-                current = step.to;
-                moved = true;
-                advanced = true;
-                break;
-            }
-        }
-        if (!advanced) break;
+/// The step that unlocks `slug`, if it is the later half of a line.
+pub fn unlockStep(slug: []const u8) ?Step {
+    for (traditional) |step| {
+        if (std.mem.eql(u8, step.to, slug)) return step;
     }
-    return if (moved) current else null;
+    return null;
 }
 
-/// How far a pet has evolved, in whichever tree it belongs to.
+/// Whether `slug` is still locked: it is evolved from a pet that has not
+/// reached the step's level. `level_of` maps a slug to its current level.
+pub fn isLocked(slug: []const u8, context: anytype, comptime level_of: fn (@TypeOf(context), []const u8) u32) bool {
+    const step = unlockStep(slug) orelse return false;
+    return level_of(context, step.from) < step.level;
+}
+
+/// How far a pet has evolved. Pets in a traditional line keep their own
+/// sprite (the next stage is a separate entry), so they show no stage.
 pub fn stageOf(slug: []const u8, level: u32) u8 {
-    if (inTraditionalTree(slug)) {
-        const form = traditionalForm(slug, level) orelse return 0;
-        return if (std.mem.eql(u8, form, slug)) 0 else 1;
-    }
+    if (inTraditionalTree(slug)) return 0;
     return stageFor(level);
 }
 
@@ -133,7 +130,22 @@ test "a tinted pixel keeps its transparency and darkness" {
     try std.testing.expectEqual(@as(u8, 1), untouched[0]);
 }
 
-test "traditional lines follow the level" {
-    try std.testing.expect(traditionalForm("anything", 99) == null);
-    try std.testing.expect(!inTraditionalTree("anything"));
+fn testLevel(levels: []const u32, slug: []const u8) u32 {
+    return if (std.mem.eql(u8, slug, "squirtle")) levels[0] else if (std.mem.eql(u8, slug, "wartortle")) levels[1] else 1;
+}
+
+test "a later species stays locked until the earlier one reaches the step level" {
+    const levels = [_]u32{ traditional[0].level - 1, 1 };
+    try std.testing.expect(isLocked("wartortle", @as([]const u32, &levels), testLevel));
+    try std.testing.expect(isLocked("blastoise", @as([]const u32, &levels), testLevel));
+    try std.testing.expect(!isLocked("squirtle", @as([]const u32, &levels), testLevel));
+    try std.testing.expect(!isLocked("anything", @as([]const u32, &levels), testLevel));
+    const evolved = [_]u32{ traditional[0].level, traditional[1].level };
+    try std.testing.expect(!isLocked("wartortle", @as([]const u32, &evolved), testLevel));
+    try std.testing.expect(!isLocked("blastoise", @as([]const u32, &evolved), testLevel));
+}
+
+test "traditional pets keep their own sprite and the default tree is unaffected" {
+    try std.testing.expectEqual(@as(u8, 0), stageOf("squirtle", 99));
+    try std.testing.expectEqual(@as(u8, 2), stageOf("anything", 99));
 }

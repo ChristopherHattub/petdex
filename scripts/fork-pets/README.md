@@ -6,6 +6,3 @@ Pets this fork bundles. `scripts/install-fork-macos.sh` copies each folder into
 Evolution lines are listed in `packages/petdex-desktop-native/src/evolution.zig`.
 A later species (e.g. `wartortle`) stays hidden from the collection until the earlier
 one (`squirtle`) reaches the step's level; the earlier pet is always kept.
-
-Blastoise is in the table but has no art here yet: add `blastoise/pet.json` +
-`spritesheet.webp` in this folder and it unlocks when Wartortle reaches its level.

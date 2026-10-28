@@ -124,6 +124,13 @@ LAUNCHER="$HOME/Desktop/Update Petdex.command"
 printf '#!/bin/bash\nexec "%s/scripts/install-fork-macos.sh" --yes\n' "$REPO" > "$LAUNCHER"
 chmod +x "$LAUNCHER"
 
+# Pets this fork bundles (see scripts/fork-pets/README.md).
+for pet in "$REPO"/scripts/fork-pets/*/; do
+  [ -f "$pet/pet.json" ] || continue
+  mkdir -p "$HOME/.petdex/pets/$(basename "$pet")"
+  cp "$pet"/pet.json "$pet"/spritesheet.webp "$HOME/.petdex/pets/$(basename "$pet")/"
+done
+
 echo
 echo "Installed $DEST. Launching it now."
 open "$DEST"

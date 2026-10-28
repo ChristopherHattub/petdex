@@ -1358,6 +1358,29 @@ fn petNameOk(name: []const u8) bool {
     return true;
 }
 
+/// XP the scan consults to hide evolutions that are still locked. Boot
+/// loads it before the model exists; `refreshCatalog` copies the model's.
+var catalog_xp: xp_mod.Store = .{};
+
+fn levelOfSlug(store: *const xp_mod.Store, slug: []const u8) u32 {
+    return store.progressOf(slug).level;
+}
+
+fn evolutionLocked(slug: []const u8) bool {
+    return evolution.isLocked(slug, &catalog_xp, levelOfSlug);
+}
+
+/// How many later species of a traditional line the XP has unlocked; a
+/// change means the collection needs a rescan.
+fn unlockedEvolutions(store: *const xp_mod.Store) usize {
+    var n: usize = 0;
+    for (evolution.traditional) |step| {
+        if (levelOfSlug(store, step.from) >= step.level) n += 1;
+    }
+    return n;
+}
+var scanned_unlocks: usize = 0;
+
 fn scanCatalog(io: std.Io, allocator: std.mem.Allocator) void {
     const home = env_home orelse return;
     const roots = [_][]const u8{ ".petdex/pets", ".codex/pets" };
@@ -1370,6 +1393,7 @@ fn scanCatalog(io: std.Io, allocator: std.mem.Allocator) void {
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .directory) continue;
             if (!petNameOk(entry.name)) continue;
+            if (evolutionLocked(entry.name)) continue;
             if (catalog_mod.catalog_len >= max_catalog) return;
             var duplicate = false;
             for (catalog[0..catalog_mod.catalog_len]) |*existing| {
@@ -1408,6 +1432,8 @@ fn refreshCatalog(model: *Model) void {
     defer scope.deinit();
     const io = scope.io();
     const active_name = model.pet_name[0..model.pet_name_len];
+    catalog_xp = model.xp;
+    scanned_unlocks = unlockedEvolutions(&catalog_xp);
     catalog_mod.catalog_len = 0;
     if (model.sheet_loaded and petNameOk(active_name)) {
         for (installer.install_roots) |root| {
@@ -1636,11 +1662,9 @@ const max_sheet_pixel_bytes: usize = 16 * 1024 * 1024;
 /// lives in the runtime's registry, not in the decoder, which honors
 /// whatever buffer the caller hands it. Loop-thread only, per the
 /// `PlatformServices.decodeImage` contract.
-/// Per catalog pet: the tint its current evolution wears, and the pet whose
-/// sprite stands in once a traditional line has moved on. Kept in step with
+/// Per catalog pet: the tint its current evolution wears. Kept in step with
 /// the XP store by `refreshEvolution`; `decodeSheet` reads them.
 var evo_tint: [max_catalog]evolution.Tint = @splat(.none);
-var evo_redirect: [max_catalog]?usize = @splat(null);
 var evo_changed: [max_catalog]bool = @splat(false);
 
 /// Recompute every pet's form from its level. Returns true when any pet's
@@ -1651,15 +1675,9 @@ fn refreshEvolution(model: *const Model) bool {
         const slug = entry.slice();
         const level = model.xp.progressOf(slug).level;
         var tint: evolution.Tint = .none;
-        var redirect: ?usize = null;
-        if (evolution.inTraditionalTree(slug)) {
-            if (evolution.traditionalForm(slug, level)) |form| redirect = catalog_mod.catalogIndexOf(form);
-        } else {
-            tint = evolution.tintFor(evolution.stageFor(level));
-        }
-        if (tint != evo_tint[i] or redirect != evo_redirect[i]) {
+        if (!evolution.inTraditionalTree(slug)) tint = evolution.tintFor(evolution.stageFor(level));
+        if (tint != evo_tint[i]) {
             evo_tint[i] = tint;
-            evo_redirect[i] = redirect;
             evo_changed[i] = true;
             any = true;
         }
@@ -1689,8 +1707,7 @@ fn applyEvolution(model: *Model, fx: *Effects) void {
 
 fn decodeSheet(fx: *Effects, entry: *const CatalogEntry) ?Sheet {
     const index = catalog_mod.catalogIndexOf(entry.slice());
-    const shown: *const CatalogEntry = if (index) |i| (if (evo_redirect[i]) |r| &catalog[r] else entry) else entry;
-    const out = decodeSheetRaw(fx, shown) orelse return null;
+    const out = decodeSheetRaw(fx, entry) orelse return null;
     if (index) |i| evolution.applyTint(out.pixels, evo_tint[i]);
     return out;
 }
@@ -2139,6 +2156,8 @@ fn buildAgentAnim(model: *Model, fx: *Effects) void {
 /// loop-thread only, so main() has nothing to decode with yet.
 fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map) !void {
     _ = environ_map;
+    if (env_home) |home| catalog_xp = xp_mod.load(allocator, home);
+    scanned_unlocks = unlockedEvolutions(&catalog_xp);
     scanCatalog(io, allocator);
     if (catalog_mod.catalog_len == 0) return error.NoPetInstalled;
 
@@ -3726,6 +3745,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = expireBubbles(model, now);
             _ = agent_rail.expire(&model.rail, now);
             awardXp(model, now);
+            // A pet reaching an evolution level unlocks the next species
+            // as a new entry; the earlier one stays in the collection.
+            if (unlockedEvolutions(&model.xp) != scanned_unlocks) refreshCatalog(model);
             if (refreshEvolution(model)) applyEvolution(model, fx);
             // The flourish reads this clock instead of the coarse anim one;
             // it only advances while one plays (plus one tick to clear it),
@@ -7651,7 +7673,6 @@ test "reaching an evolution level tints the pet and marks it changed" {
         catalog_mod.catalog_len = saved_len;
         catalog_mod.catalog = saved;
         evo_tint = @splat(.none);
-        evo_redirect = @splat(null);
         evo_changed = @splat(false);
     }
     @memcpy(catalog_mod.catalog[0].name[0..5], "alpha");
@@ -7667,4 +7688,18 @@ test "reaching an evolution level tints the pet and marks it changed" {
     _ = model.xp.add("alpha", xp_mod.threshold(evolution.second_evolution_level));
     try std.testing.expect(refreshEvolution(&model));
     try std.testing.expectEqual(evolution.Tint.gold, evo_tint[0]);
+}
+
+test "a later species unlocks as a new entry once the earlier one reaches the step level" {
+    const saved = catalog_xp;
+    defer catalog_xp = saved;
+    catalog_xp = .{};
+    try std.testing.expect(evolutionLocked("wartortle"));
+    try std.testing.expect(!evolutionLocked("squirtle"));
+    try std.testing.expectEqual(@as(usize, 0), unlockedEvolutions(&catalog_xp));
+    _ = catalog_xp.add("squirtle", xp_mod.threshold(evolution.traditional[0].level));
+    try std.testing.expect(!evolutionLocked("wartortle"));
+    try std.testing.expect(!evolutionLocked("squirtle"));
+    try std.testing.expect(evolutionLocked("blastoise"));
+    try std.testing.expectEqual(@as(usize, 1), unlockedEvolutions(&catalog_xp));
 }
